@@ -9,16 +9,24 @@
 #include <stdio.h>      // FILE, fopen, fclose, fwrite, fprintf, stderr
 #include <stdint.h>     // uint8_t, uint16_t, ptrdiff_t
 #include <stddef.h>     // size_t, NULL
-#include <stdlib.h>     // malloc, free, exit
+#include <stdlib.h>     // malloc, free, exit, abort
 #include <string.h>     // memmove, memcmp, memset
 #include <stdbool.h>    // true, false, bool
 #include <assert.h>     // assert
+#include <math.h>       // powf, INFINITY
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 #define UNUSED(x) ((void) (x))
 
+#define ARRAY_SIZE(array) ((isize) sizeof(array) / sizeof((array)[0]))
+
 typedef uint8_t u8;
 typedef uint16_t u16;
+typedef uint32_t u32;
 typedef ptrdiff_t isize;
+typedef float f32;
 
 #define sizeof(x) ((isize) sizeof(x))
 
@@ -45,7 +53,7 @@ void file_write_all(FILE *file, u8 const *source, isize size) {
 
     if (size != bytes_written) {
         // Failed to write to the output file.
-        exit(1);
+        abort();
     }
 }
 
@@ -66,7 +74,7 @@ void *alloc(isize size) {
     void *memory = malloc((size_t) size);
     if (memory == NULL) {
         // Out of memory.
-        exit(1);
+        abort();
     }
 
     return memory;
@@ -226,37 +234,96 @@ void lzw_write_code(LzwCodesWriter *writer, LzwCode code, isize code_bit_length)
     }
 }
 
-#define IMAGE_BYTES_PER_PIXEL 4
-#define RED_INDEX 2
+#define RED_INDEX 0
 #define GREEN_INDEX 1
-#define BLUE_INDEX 0
+#define BLUE_INDEX 2
 
-int main(void) {
-    isize image_width = 800;
-    isize image_height = 600;
-    if (image_width > GIF_MAX_WIDTH || image_height > GIF_MAX_HEIGHT) {
-        // Image dimensions are too big for a GIF.
-        exit(1);
-    }
+typedef u32 RGB;
 
-    u8 *image = alloc(image_width * image_height * IMAGE_BYTES_PER_PIXEL);
-    /* Generate a blank white image */ {
-        u8 *image_iter = image;
-        for (isize y = 0; y < image_height; y += 1) {
-            for (isize x = 0; x < image_width; x += 1) {
-                image_iter[RED_INDEX] = 0xff;
-                image_iter[GREEN_INDEX] = 0xff;
-                image_iter[BLUE_INDEX] = 0xff;
+#define RGB(red, green, blue) ((RGB) red << 16 | (RGB) green << 8 | (RGB) blue)
 
-                image_iter += IMAGE_BYTES_PER_PIXEL;
+typedef struct {
+    isize count;
+    RGB colors[256];
+} ColorTable;
+
+void color_table_black_and_white(ColorTable *color_table) {
+    color_table->count = 2;
+    color_table->colors[0] = 0x000000;
+    color_table->colors[1] = 0xffffff;
+}
+
+void color_table_web_safe(ColorTable *color_table) {
+    isize count = 0;
+    for (RGB red = 0x00; red <= 0xff; red += 0x33) {
+        for (RGB green = 0x00; green <= 0xff; green += 0x33) {
+            for (RGB blue = 0x00; blue <= 0xff; blue += 0x33) {
+                assert(count < ARRAY_SIZE(color_table->colors));
+                color_table->colors[count] = RGB(red, green, blue);
+
+                count += 1;
             }
         }
+    }
+
+    color_table->count = count;
+}
+
+#define GAMMA 2.2F
+
+ColorIndex color_table_get_index(ColorTable *color_table, RGB needle) {
+    f32 needle_red = powf((f32) ((needle >> 16) & 0xff) / 255.0F, GAMMA);
+    f32 needle_green = powf((f32) ((needle >> 8) & 0xff) / 255.0F, GAMMA);
+    f32 needle_blue = powf((f32) (needle & 0xff) / 255.0F, GAMMA);
+
+    ColorIndex best_match = 0;
+    f32 best_match_distance = INFINITY;
+
+    RGB *color_iter = color_table->colors;
+    while (color_iter < color_table->colors + color_table->count) {
+        f32 iter_red = powf((f32) ((*color_iter >> 16) & 0xff) / 255.0F, GAMMA);
+        f32 iter_green = powf((f32) ((*color_iter >> 8) & 0xff) / 255.0F, GAMMA);
+        f32 iter_blue = powf((f32) (*color_iter & 0xff) / 255.0F, GAMMA);
+
+        f32 iter_distance =
+            (iter_red - needle_red) * (iter_red - needle_red) +
+            (iter_green - needle_green) * (iter_green - needle_green) +
+            (iter_blue - needle_blue) * (iter_blue - needle_blue);
+
+        if (iter_distance < best_match_distance) {
+            best_match = (ColorIndex) (color_iter - color_table->colors);
+            best_match_distance = iter_distance;
+        }
+
+        color_iter += 1;
+    }
+
+    return best_match;
+}
+
+int main(void) {
+    ColorTable color_table;
+    color_table_web_safe(&color_table);
+
+    int image_width;
+    int image_height;
+    int image_bytes_per_pixel;
+    u8 *image = stbi_load("input.jpg", &image_width, &image_height, &image_bytes_per_pixel, 0);
+
+    if (image == NULL) {
+        // Failed to load an image.
+        abort();
+    }
+
+    if (image_width > GIF_MAX_WIDTH || image_height > GIF_MAX_HEIGHT) {
+        // Image dimensions are too big for a GIF.
+        abort();
     }
 
     FILE *output_file = fopen("out.gif", "wb");
     if (output_file == NULL) {
         // Failed to open an output file.
-        exit(1);
+        abort();
     }
 
 
@@ -280,17 +347,46 @@ int main(void) {
     // Logical screen descriptor
     header_iter = U16_WRITE_LE(image_width, header_iter);
     header_iter = U16_WRITE_LE(image_height, header_iter);
-    header_iter = U8_WRITE(0x80, header_iter);
+
+    // FIXME: next_power_of_two is the worst variable name ever.
+    assert(color_table.count > 0);
+    int next_power_of_two =
+        sizeof(unsigned int) * 8 -
+        __builtin_clz((unsigned int) color_table.count);
+    if ((color_table.count & (color_table.count - 1)) == 0) {
+        next_power_of_two -= 1;
+    }
+    if (next_power_of_two < 1) {
+        next_power_of_two = 1;
+    }
+    if (next_power_of_two > 8) {
+        // color table is too big
+        abort();
+    }
+
+    header_iter = U8_WRITE(0x80 | (u8) (next_power_of_two - 1), header_iter);
+
     header_iter = U8_WRITE(0, header_iter);
     header_iter = U8_WRITE(0, header_iter);
 
-    // Global color table (black and white)
-    header_iter = U8_WRITE(0x00, header_iter);
-    header_iter = U8_WRITE(0x00, header_iter);
-    header_iter = U8_WRITE(0x00, header_iter);
-    header_iter = U8_WRITE(0xff, header_iter);
-    header_iter = U8_WRITE(0xff, header_iter);
-    header_iter = U8_WRITE(0xff, header_iter);
+    // Global color table
+    {
+        RGB *color_iter = color_table.colors;
+
+        for (isize i = 0; i < (1 << next_power_of_two); i += 1) {
+            if (color_iter < color_table.colors + color_table.count) {
+                header_iter = U8_WRITE(*color_iter >> 16, header_iter);
+                header_iter = U8_WRITE((*color_iter >> 8) & 0xff, header_iter);
+                header_iter = U8_WRITE(*color_iter & 0xff, header_iter);
+
+                color_iter += 1;
+            } else {
+                header_iter = U8_WRITE(0x00, header_iter);
+                header_iter = U8_WRITE(0x00, header_iter);
+                header_iter = U8_WRITE(0x00, header_iter);
+            }
+        }
+    }
 
     file_write_all(output_file, header, header_iter - header);
 
@@ -323,7 +419,7 @@ int main(void) {
 
     // Minimum LZW code bit length
     // TODO: This value should be computed from the size of the color table.
-    isize lzw_code_min_bit_length = 2;
+    isize lzw_code_min_bit_length = next_power_of_two;
     *(image_header_iter++) = (u8) lzw_code_min_bit_length;
 
     file_write_all(output_file, image_header, image_header_iter - image_header);
@@ -347,17 +443,12 @@ int main(void) {
     LzwTable *lzw_table = alloc(sizeof(LzwTable));
     lzw_table->count = next_lzw_code;
 
-    ColorIndex black_index = 0;
-    ColorSequence *black_color_sequence = alloc(sizeof(ColorSequence) + sizeof(ColorIndex));
-    black_color_sequence->count = 1;
-    black_color_sequence->indices[0] = black_index;
-    lzw_table->sequences[black_index] = black_color_sequence;
-
-    ColorIndex white_index = 1;
-    ColorSequence *white_color_sequence = alloc(sizeof(ColorSequence) + sizeof(ColorIndex));
-    white_color_sequence->count = 1;
-    white_color_sequence->indices[0] = white_index;
-    lzw_table->sequences[white_index] = white_color_sequence;
+    for (isize color_index = 0; color_index < (1 << next_power_of_two); color_index += 1) {
+        ColorSequence *black_color_sequence = alloc(sizeof(ColorSequence) + sizeof(ColorIndex));
+        black_color_sequence->count = 1;
+        black_color_sequence->indices[0] = (ColorIndex) color_index;
+        lzw_table->sequences[color_index] = black_color_sequence;
+    }
 
     // Create a dummy sequence for the unused LZW codes, as well as for the "clear" and the "end of
     // information" codes, so that we don't have to handle these codes differently from others when
@@ -365,14 +456,16 @@ int main(void) {
     ColorSequence *dummy_sequence = alloc(sizeof(ColorSequence));
     dummy_sequence->count = 0;
 
-    // TODO: Start from the "size of the color table" instead of a hard-coded value
-    // (2 for the black-and-white table).
-    for (LzwCode dummy_code = 2; dummy_code < next_lzw_code; dummy_code += 1) {
+    for (
+        LzwCode dummy_code = (1 << next_power_of_two);
+        dummy_code < next_lzw_code;
+        dummy_code += 1
+    ) {
         lzw_table->sequences[dummy_code] = dummy_sequence;
     }
 
     u8 *image_iter = image;
-    u8 *image_end = image + image_width * image_height * IMAGE_BYTES_PER_PIXEL;
+    u8 *image_end = image + image_width * image_height * image_bytes_per_pixel;
 
     ColorArray current_sequence = {NULL};
 
@@ -383,17 +476,9 @@ int main(void) {
     u8 red = image_iter[RED_INDEX];
     u8 green = image_iter[GREEN_INDEX];
     u8 blue = image_iter[BLUE_INDEX];
-    image_iter += IMAGE_BYTES_PER_PIXEL;
+    image_iter += image_bytes_per_pixel;
 
-    if (red == 0x00 && green == 0x00 && blue == 0x00) {
-        color_array_push(&current_sequence, black_index);
-    } else if (red == 0xff && green == 0xff && blue == 0xff) {
-        color_array_push(&current_sequence, white_index);
-    } else {
-        // TODO: Search for the closest available color? Preprocess the image so that it only
-        // contains colors from the color table?
-        exit(1);
-    }
+    color_array_push(&current_sequence, color_table_get_index(&color_table, RGB(red, green, blue)));
 
     while (image_iter < image_end || current_sequence.count > 0) {
         bool nonexistent_sequence_found = false;
@@ -443,20 +528,15 @@ int main(void) {
             }
 
             if (image_iter < image_end) {
-                // TODO: Code duplication.
+                u8 red = image_iter[RED_INDEX];
+                u8 green = image_iter[GREEN_INDEX];
+                u8 blue = image_iter[BLUE_INDEX];
+                image_iter += image_bytes_per_pixel;
 
-                u8 blue = *(image_iter + 0);
-                u8 green = *(image_iter + 1);
-                u8 red = *(image_iter + 2);
-                image_iter += IMAGE_BYTES_PER_PIXEL;
-
-                if (red == 0x00 && green == 0x00 && blue == 0x00) {
-                    color_array_push(&current_sequence, black_index);
-                } else if (red == 0xff && green == 0xff && blue == 0xff) {
-                    color_array_push(&current_sequence, white_index);
-                } else {
-                    exit(1);
-                }
+                color_array_push(
+                    &current_sequence,
+                    color_table_get_index(&color_table, RGB(red, green, blue))
+                );
             } else {
                 break;
             }
@@ -471,6 +551,8 @@ int main(void) {
         // TODO: Simplify this part given the info above.
 
         if (nonexistent_sequence_found && lzw_table->count == MAX_LZW_CODE + 1) {
+            lzw_write_code(&lzw_writer, lzw_clear_code, lzw_code_bit_length);
+
             image_iter = image_iter_rewind;
             current_sequence.count = 1;
 
@@ -481,7 +563,6 @@ int main(void) {
             lzw_table->count = lzw_clear_code + 2;
             lzw_code_bit_length = lzw_code_min_bit_length + 1;
 
-            lzw_write_code(&lzw_writer, lzw_clear_code, lzw_code_bit_length);
             continue;
         }
 
@@ -491,28 +572,31 @@ int main(void) {
             // In here current_sequence length is at least 2 because all possible sequences of
             // length 1 are guaranteed to exist in the table.
 
-            ColorSequence *new_sequence = alloc(
-                sizeof(ColorSequence) + current_sequence.count * sizeof(ColorIndex)
-            );
-            new_sequence->count = current_sequence.count;
-            memmove(
-                new_sequence->indices,
-                current_sequence.indices,
-                (size_t) (current_sequence.count * sizeof(ColorIndex))
-            );
 
-            lzw_table->sequences[lzw_table->count] = new_sequence;
+            if (lzw_table->count != MAX_LZW_CODE + 1) {
+                ColorSequence *new_sequence = alloc(
+                    sizeof(ColorSequence) + current_sequence.count * sizeof(ColorIndex)
+                );
+                new_sequence->count = current_sequence.count;
+                memmove(
+                    new_sequence->indices,
+                    current_sequence.indices,
+                    (size_t) (current_sequence.count * sizeof(ColorIndex))
+                );
 
-            // Increase the LZW code length here because the spec says so:
-            // > Whenever the LZW code value would exceed the current code length,
-            // > the code length is increased by one. The packing/unpacking of these
-            // > codes must then be altered to reflect the new code length.
+                lzw_table->sequences[lzw_table->count] = new_sequence;
 
-            if ((lzw_table->count & (lzw_table->count - 1)) == 0) {
-                lzw_code_bit_length += 1;
+                // Increase the LZW code length here because the spec says so:
+                // > Whenever the LZW code value would exceed the current code length,
+                // > the code length is increased by one. The packing/unpacking of these
+                // > codes must then be altered to reflect the new code length.
+
+                if ((lzw_table->count & (lzw_table->count - 1)) == 0) {
+                    lzw_code_bit_length += 1;
+                }
+
+                lzw_table->count += 1;
             }
-
-            lzw_table->count += 1;
 
             ColorIndex next_after_existing = current_sequence.indices[current_sequence.count - 1];
             current_sequence.count = 1;
