@@ -41,6 +41,14 @@ typedef float f32;
     (dest) + 2                                  \
 )
 
+static inline u8 u8_min(u8 a, u8 b) {
+    return a < b ? a : b;
+}
+
+static inline u8 u8_max(u8 a, u8 b) {
+    return a > b ? a : b;
+}
+
 void file_write_all(FILE *file, u8 const *source, isize size) {
     isize bytes_written = (isize) fwrite(source, 1, (size_t) size, file);
 
@@ -301,10 +309,268 @@ ColorIndex color_table_get_index(ColorTable *color_table, RGB needle) {
     return best_match;
 }
 
-int main(void) {
-    ColorTable color_table;
-    color_table_web_safe(&color_table);
+typedef struct {
+    bool has_value;
+    RGB color;
+} ColorSetBucket;
 
+typedef struct {
+    ColorSetBucket *buckets;
+    isize buckets_count;
+    isize colors_count;
+} ColorSet;
+
+u32 rgb_hash(RGB value) {
+    // Based on djb2 hashing function:
+    // http://www.cse.yorku.ca/~oz/hash.html
+
+    u32 hash = 5381;
+
+    hash = ((hash << 5) + hash) + ((value >> 16) & 0xff);
+    hash = ((hash << 5) + hash) + ((value >> 8) & 0xff);
+    hash = ((hash << 5) + hash) + (value & 0xff);
+
+    return hash;
+}
+
+void color_set_insert(ColorSet *colors, RGB new_color) {
+    f32 fill_factor;
+    if (colors->buckets_count == 0) {
+        fill_factor = 1.0F;
+    } else {
+        fill_factor = (f32) colors->colors_count / colors->buckets_count;
+    }
+
+    if (fill_factor > 0.75F) {
+        isize new_buckets_count = colors->buckets_count * 2;
+        if (new_buckets_count < 16) {
+            new_buckets_count = 16;
+        }
+
+        ColorSetBucket *new_buckets = malloc((size_t) (new_buckets_count * sizeof(ColorSetBucket)));
+        memset(new_buckets, 0, (size_t) (new_buckets_count * sizeof(ColorSetBucket)));
+
+        ColorSet rehashed_colors = {
+            .buckets = new_buckets,
+            .buckets_count = new_buckets_count,
+            .colors_count = 0,
+        };
+
+        for (isize i = 0; i < colors->buckets_count; i += 1) {
+            if (colors->buckets[i].has_value) {
+                color_set_insert(&rehashed_colors, colors->buckets[i].color);
+            }
+        }
+
+        free(colors->buckets);
+        colors->buckets = rehashed_colors.buckets;
+        colors->buckets_count = rehashed_colors.buckets_count;
+        colors->colors_count = rehashed_colors.colors_count;
+    }
+
+    ColorSetBucket *bucket = &colors->buckets[rgb_hash(new_color) % colors->buckets_count];
+    while (bucket->has_value) {
+        if (bucket->color == new_color) {
+            return;
+        }
+
+        bucket += 1;
+        if (bucket == colors->buckets + colors->buckets_count) {
+            bucket = colors->buckets;
+        }
+    }
+
+    bucket->color = new_color;
+    bucket->has_value = true;
+    colors->colors_count += 1;
+}
+
+typedef struct {
+    u8 *data;
+    isize size;
+    isize bytes_per_pixel;
+} Image;
+
+int rgb_compare_red_only(void const *left, void const *right) {
+    u8 left_red = (*((RGB *) left) >> 16) & 0xff;
+    u8 right_red = (*((RGB *) right) >> 16) & 0xff;
+
+    return (int) left_red - (int) right_red;
+}
+
+int rgb_compare_green_only(void const *left, void const *right) {
+    u8 left_green = (*((RGB *) left) >> 8) & 0xff;
+    u8 right_green = (*((RGB *) right) >> 8) & 0xff;
+
+    return (int) left_green - (int) right_green;
+}
+
+int rgb_compare_blue_only(void const *left, void const *right) {
+    u8 left_blue = *((RGB *) left) & 0xff;
+    u8 right_blue = *((RGB *) right) & 0xff;
+
+    return (int) left_blue - (int) right_blue;
+}
+
+void median_cut_color_table(
+    Image *image,
+    isize target_colors_count,
+    ColorTable *color_table
+) {
+    // FIXME: Add an assert that target_colors_count is less than 256
+
+    ColorSet color_set = {NULL};
+
+    u8 *image_data_iter = image->data;
+    while (image_data_iter < image->data + image->size) {
+        RGB color = RGB(
+            image_data_iter[RED_INDEX],
+            image_data_iter[GREEN_INDEX],
+            image_data_iter[BLUE_INDEX]
+        );
+        color_set_insert(&color_set, color);
+
+        image_data_iter += image->bytes_per_pixel;
+    }
+
+    RGB *colors = alloc(color_set.colors_count * sizeof(RGB));
+    RGB *colors_end = colors + color_set.colors_count;
+
+    {
+        RGB *colors_iter = colors;
+        ColorSetBucket *buckets_iter = color_set.buckets;
+        while (buckets_iter < color_set.buckets + color_set.buckets_count) {
+            if (buckets_iter->has_value) {
+                assert(colors_iter != colors_end);
+
+                *colors_iter = buckets_iter->color;
+                colors_iter += 1;
+            }
+
+            buckets_iter += 1;
+        }
+
+        assert(colors_iter == colors_end);
+    }
+
+    isize segments_capacity = target_colors_count;
+
+    // FIXME: Compute this from segment_begin_index and segment_end_index?
+    isize segments_count = 1;
+
+    RGB **segments_begins = alloc(segments_capacity * sizeof(RGB *));
+    segments_begins[0] = colors;
+    RGB **segments_ends = alloc(segments_capacity * sizeof(RGB *));
+    segments_ends[0] = colors_end;
+
+    isize segment_begin_index = 0;
+    isize segment_end_index = 1;
+
+    // FIXME: What if the number of target_colors_count is smaller than the actual nubmer of colors
+    // in the image?
+
+    while (segments_count < target_colors_count) {
+        assert(segment_begin_index != segment_end_index);
+
+        RGB *current_segment_begin = segments_begins[segment_begin_index];
+        RGB *current_segment_end = segments_ends[segment_begin_index];
+
+        // The image probably has less colors then we want in our palette, break out because
+        // segments are naturally sorted by decreasing size, so the rest of the segments are goning
+        // to be of size 1 as well.
+        if (current_segment_end - current_segment_begin == 1) {
+            break;
+        }
+
+        segment_begin_index = (segment_begin_index + 1) % segments_capacity;
+        segments_count -= 1;
+
+        u8 min_red = 0xff, min_green = 0xff, min_blue = 0xff;
+        u8 max_red = 0x00, max_green = 0x00, max_blue = 0x00;
+        {
+            RGB *colors_iter = current_segment_begin;
+            while (colors_iter != current_segment_end) {
+                u8 red = (*colors_iter >> 16) & 0xff;
+                u8 green = (*colors_iter >> 8) & 0xff;
+                u8 blue = *colors_iter & 0xff;
+
+                min_red = u8_min(min_red, red);
+                min_green = u8_min(min_green, green);
+                min_blue = u8_min(min_blue, blue);
+
+                max_red = u8_max(max_red, red);
+                max_green = u8_max(max_green, green);
+                max_blue = u8_max(max_blue, blue);
+
+                colors_iter += 1;
+            }
+        }
+
+        int(*comparator)(void const *, void const *);
+
+        if (max_red - min_red >= max_green - min_green && max_red - min_red >= max_blue - min_blue) {
+            comparator = rgb_compare_red_only;
+        } else if (max_green - min_green >= max_red - min_red && max_green - min_green >= max_blue - min_blue) {
+            comparator = rgb_compare_green_only;
+        } else {
+            comparator = rgb_compare_blue_only;
+        }
+
+        assert(current_segment_begin < current_segment_end);
+        qsort(
+            current_segment_begin,
+            current_segment_end - current_segment_begin,
+            sizeof(RGB),
+            comparator
+        );
+
+        isize current_segment_size = current_segment_end - current_segment_begin;
+        assert(current_segment_size > 1);
+
+        segments_begins[segment_end_index] = current_segment_begin;
+        segments_ends[segment_end_index] = current_segment_begin + current_segment_size / 2;
+
+        segments_begins[(segment_end_index + 1) % segments_capacity] = current_segment_begin + current_segment_size / 2;
+        segments_ends[(segment_end_index + 1) % segments_capacity] = current_segment_end;
+
+        segment_end_index = (segment_end_index + 2) % segments_capacity;
+        segments_count += 2;
+    }
+
+    color_table->count = segments_count;
+    RGB *palette_iter = color_table->colors;
+    for (isize i = 0; i < segments_count; i += 1) {
+        isize segment_index = (segment_begin_index + i) % segments_capacity;
+
+        u32 red_sum = 0;
+        u32 green_sum = 0;
+        u32 blue_sum = 0;
+
+        RGB *segment_iter = segments_begins[segment_index];
+        RGB *segment_end = segments_ends[segment_index];
+        while (segment_iter != segment_end) {
+            // FIXME: Take gamma into account, maybe??
+
+            red_sum += (*segment_iter >> 16) & 0xff;
+            green_sum += (*segment_iter >> 8) & 0xff;
+            blue_sum += *segment_iter & 0xff;
+
+            segment_iter += 1;
+        }
+
+        isize colors_count = segments_ends[segment_index] - segments_begins[segment_index];
+        RGB average = RGB(
+            red_sum / colors_count,
+            green_sum / colors_count,
+            blue_sum / colors_count
+        );
+
+        *palette_iter = average;
+        palette_iter += 1;
+    }
+}
+
+int main(void) {
     int image_width;
     int image_height;
     int image_bytes_per_pixel;
@@ -314,6 +580,18 @@ int main(void) {
         // Failed to load an image.
         abort();
     }
+
+    ColorTable color_table;
+
+    median_cut_color_table(
+        &(Image) {
+            .data = image,
+            .size = image_width * image_height * image_bytes_per_pixel,
+            .bytes_per_pixel = image_bytes_per_pixel,
+        },
+        256,
+        &color_table
+    );
 
     if (image_width > GIF_MAX_WIDTH || image_height > GIF_MAX_HEIGHT) {
         // Image dimensions are too big for a GIF.
