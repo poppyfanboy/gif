@@ -1,0 +1,8 @@
+-std=c99
+-Wall
+-Wextra
+-Wconversion
+-Wshadow
+-Wpedantic
+-Wno-keyword-macro
+-Wno-missing-field-initializers
