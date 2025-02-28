@@ -327,24 +327,38 @@ f32 f32x3_dot(f32x3 left, f32x3 right) {
     return left.x * right.x + left.y * right.y + left.z * right.z;
 }
 
+#define GAMMA 2.2F
+
 #define GIF_MAX_COLORS 256
 
 typedef struct {
     isize count;
-    RGB colors[GIF_MAX_COLORS];
+    RGB srgb_colors[GIF_MAX_COLORS];
+    f32x3 rgb_colors[GIF_MAX_COLORS];
 } ColorTable;
+
+void color_table_compute_linear_rgb(ColorTable *color_table) {
+    for (isize color_index = 0; color_index < color_table->count; color_index += 1) {
+        f32x3 rgb = rgb_to_f32x3(color_table->srgb_colors[color_index]);
+        color_table->rgb_colors[color_index] = f32x3_pow(rgb, GAMMA);
+    }
+}
 
 void color_table_black_and_white(ColorTable *color_table) {
     color_table->count = 2;
-    color_table->colors[0] = rgb(0x00, 0x00, 0x00);
-    color_table->colors[1] = rgb(0xff, 0xff, 0xff);
+    color_table->srgb_colors[0] = rgb(0x00, 0x00, 0x00);
+    color_table->srgb_colors[1] = rgb(0xff, 0xff, 0xff);
+
+    color_table_compute_linear_rgb(color_table);
 }
 
 void color_table_monochrome(ColorTable *color_table) {
     color_table->count = 256;
     for (int component = 0x00; component <= 0xff; component += 1) {
-        color_table->colors[component] = rgb((u8) component, (u8) component, (u8) component);
+        color_table->srgb_colors[component] = rgb((u8) component, (u8) component, (u8) component);
     }
+
+    color_table_compute_linear_rgb(color_table);
 }
 
 void color_table_web_safe(ColorTable *color_table) {
@@ -352,8 +366,8 @@ void color_table_web_safe(ColorTable *color_table) {
     for (int red = 0x00; red <= 0xff; red += 0x33) {
         for (int green = 0x00; green <= 0xff; green += 0x33) {
             for (int blue = 0x00; blue <= 0xff; blue += 0x33) {
-                assert(count < countof(color_table->colors));
-                color_table->colors[count] = rgb((u8) red, (u8) green, (u8) blue);
+                assert(count < countof(color_table->srgb_colors));
+                color_table->srgb_colors[count] = rgb((u8) red, (u8) green, (u8) blue);
 
                 count += 1;
             }
@@ -361,9 +375,9 @@ void color_table_web_safe(ColorTable *color_table) {
     }
 
     color_table->count = count;
-}
 
-#define GAMMA 2.2F
+    color_table_compute_linear_rgb(color_table);
+}
 
 ColorIndex color_table_get_index(ColorTable *color_table, RGB needle) {
     f32x3 needle_vector = rgb_to_f32x3(needle);
@@ -372,16 +386,13 @@ ColorIndex color_table_get_index(ColorTable *color_table, RGB needle) {
     ColorIndex best_match = 0;
     f32 best_match_distance = INFINITY;
 
-    RGB *color_iter = color_table->colors;
-    while (color_iter < color_table->colors + color_table->count) {
-        f32x3 color_vector = rgb_to_f32x3(*color_iter);
-        color_vector = f32x3_pow(color_vector, GAMMA);
-
-        f32x3 distance_vector = f32x3_sub(color_vector, needle_vector);
+    f32x3 *color_iter = color_table->rgb_colors;
+    while (color_iter < color_table->rgb_colors + color_table->count) {
+        f32x3 distance_vector = f32x3_sub(*color_iter, needle_vector);
         f32 distance = f32x3_dot(distance_vector, distance_vector);
 
         if (distance < best_match_distance) {
-            best_match = (ColorIndex) (color_iter - color_table->colors);
+            best_match = (ColorIndex) (color_iter - color_table->rgb_colors);
             best_match_distance = distance;
         }
 
@@ -628,7 +639,7 @@ void color_table_median_cut(Image *image, isize target_colors_count, ColorTable 
 
     color_table->count = queue.count;
 
-    RGB *color_table_iter = color_table->colors;
+    RGB *color_table_iter = color_table->srgb_colors;
     isize segment_index = queue.first_index;
 
     while (true) {
@@ -665,6 +676,8 @@ void color_table_median_cut(Image *image, isize target_colors_count, ColorTable 
     }
 
     dealloc(colors, (colors_end - colors) * sizeof(RGB));
+
+    color_table_compute_linear_rgb(color_table);
 }
 
 int main(void) {
@@ -744,10 +757,10 @@ int main(void) {
 
     // Global color table
     {
-        RGB *color_iter = color_table.colors;
+        RGB *color_iter = color_table.srgb_colors;
 
         for (isize i = 0; i < (1 << next_power_of_two); i += 1) {
-            if (color_iter < color_table.colors + color_table.count) {
+            if (color_iter < color_table.srgb_colors + color_table.count) {
                 header_iter = u8_write((*color_iter >> RED_SHIFT) & 0xff, header_iter);
                 header_iter = u8_write((*color_iter >> GREEN_SHIFT) & 0xff, header_iter);
                 header_iter = u8_write((*color_iter >> BLUE_SHIFT) & 0xff, header_iter);
