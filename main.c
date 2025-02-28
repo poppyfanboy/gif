@@ -125,10 +125,34 @@ void *alloc_resize(void *memory, isize old_size, isize new_size) {
 
 typedef u8 ColorIndex;
 
+// TODO: Rename back to ColorSequenceNew once I finish fixing the errors.
 typedef struct {
+    ColorIndex *indices;
     isize count;
-    ColorIndex indices[];
-} ColorSequence;
+} ColorSequenceNew;
+
+u32 color_sequence_hash(ColorSequenceNew sequence) {
+    u32 hash = 5381;
+
+    ColorIndex *sequence_iter = sequence.indices;
+    while (sequence_iter < sequence.indices + sequence.count) {
+        hash = ((hash << 5) + hash) + *sequence_iter;
+
+        sequence_iter += 1;
+    }
+
+    return hash;
+}
+
+bool color_sequence_equals(ColorSequenceNew left, ColorSequenceNew right) {
+    assert(left.count != 0 || right.count != 0);
+
+    if (left.count != right.count) {
+        return false;
+    }
+
+    return memcmp(left.indices, right.indices, (size_t) (left.count * sizeof(ColorIndex))) == 0;
+}
 
 typedef struct {
     ColorIndex *indices;
@@ -166,10 +190,63 @@ typedef isize LzwCode;
 #define MAX_LZW_CODE 4095
 #define LZW_CODE_MAX_BIT_LENGTH 12
 
+// TODO: Encode the "exists" flag into the sequence pointer? Or even into the LZW code?
+
 typedef struct {
-    isize count;
-    ColorSequence *sequences[MAX_LZW_CODE + 1];
+    bool has_value;
+    ColorSequenceNew sequence;
+    LzwCode code;
+} LzwTableBucket;
+
+typedef struct {
+    isize sequences_count;
+    LzwTableBucket buckets[2 * (MAX_LZW_CODE + 1)];
 } LzwTable;
+
+LzwTable *lzw_table_create(void) {
+    LzwTable *lzw_table = alloc(sizeof(LzwTable));
+    memset(lzw_table, 0, (size_t) sizeof(LzwTable));
+
+    return lzw_table;
+}
+
+void lzw_table_insert(LzwTable *lzw_table, ColorSequenceNew new_sequence, LzwCode new_code) {
+    assert(lzw_table->sequences_count < countof(lzw_table->buckets));
+
+    isize bucket_index = color_sequence_hash(new_sequence) % countof(lzw_table->buckets);
+    while (lzw_table->buckets[bucket_index].has_value) {
+        assert(!color_sequence_equals(new_sequence, lzw_table->buckets[bucket_index].sequence));
+
+        bucket_index = (bucket_index + 1) % countof(lzw_table->buckets);
+    }
+
+    lzw_table->buckets[bucket_index].has_value = true;
+    lzw_table->buckets[bucket_index].sequence = new_sequence;
+    lzw_table->buckets[bucket_index].code = new_code;
+
+    lzw_table->sequences_count += 1;
+}
+
+bool lzw_table_get_code(LzwTable *lzw_table, ColorSequenceNew needle_sequence, LzwCode *code) {
+    isize bucket_index = color_sequence_hash(needle_sequence) % countof(lzw_table->buckets);
+    while (
+        lzw_table->buckets[bucket_index].has_value &&
+        !color_sequence_equals(needle_sequence, lzw_table->buckets[bucket_index].sequence)
+    ) {
+        bucket_index = (bucket_index + 1) % countof(lzw_table->buckets);
+    }
+
+    if (!lzw_table->buckets[bucket_index].has_value) {
+        return false;
+    } else {
+        *code = lzw_table->buckets[bucket_index].code;
+        return true;
+    }
+}
+
+void lzw_table_destroy(LzwTable *lzw_table) {
+    dealloc(lzw_table, sizeof(LzwTable));
+}
 
 // TODO: Abstract away writing to a file. Write bytes to a dynamic array instead, and let the caller
 // decide if they want to periodically flush the buffer to the file or keep stretching the buffer
@@ -820,34 +897,22 @@ int main(void) {
     LzwCode lzw_end_code = lzw_clear_code + 1;
 
     isize lzw_code_bit_length = lzw_code_min_bit_length + 1;
-    LzwCode next_lzw_code = lzw_clear_code + 2;
+    isize next_lzw_code = lzw_clear_code + 2;
 
     // Output a clear code because the spec says so:
     // > Encoders should output a Clear code as the first code of each image data stream.
     lzw_write_code(&lzw_writer, lzw_clear_code, lzw_code_bit_length);
 
-    LzwTable *lzw_table = alloc(sizeof(LzwTable));
-    lzw_table->count = next_lzw_code;
+    LzwTable *lzw_table = lzw_table_create();
 
     for (isize color_index = 0; color_index < (1 << next_power_of_two); color_index += 1) {
-        ColorSequence *black_color_sequence = alloc(sizeof(ColorSequence) + sizeof(ColorIndex));
-        black_color_sequence->count = 1;
-        black_color_sequence->indices[0] = (ColorIndex) color_index;
-        lzw_table->sequences[color_index] = black_color_sequence;
-    }
+        ColorSequenceNew single_color_sequence = {
+            .count = 1,
+            .indices = alloc(sizeof(ColorIndex))
+        };
+        single_color_sequence.indices[0] = (ColorIndex) color_index;
 
-    // Create a dummy sequence for the unused LZW codes, as well as for the "clear" and the "end of
-    // information" codes, so that we don't have to handle these codes differently from others when
-    // looking up sequences in the LZW table.
-    ColorSequence *dummy_sequence = alloc(sizeof(ColorSequence));
-    dummy_sequence->count = 0;
-
-    for (
-        LzwCode dummy_code = (1 << next_power_of_two);
-        dummy_code < next_lzw_code;
-        dummy_code += 1
-    ) {
-        lzw_table->sequences[dummy_code] = dummy_sequence;
+        lzw_table_insert(lzw_table, single_color_sequence, color_index);
     }
 
     u8 *image_iter = image;
@@ -874,40 +939,14 @@ int main(void) {
         u8 *image_iter_rewind = image_iter;
 
         while (true) {
-            bool sequence_already_exists = false;
+            // current_sequence is never empty at this point
+            assert(current_sequence.count > 0);
 
-            // TODO: Replace linear search with a hash table?
-
-            for (LzwCode lzw_code = 0; lzw_code < lzw_table->count; lzw_code += 1) {
-                if (current_sequence.count != lzw_table->sequences[lzw_code]->count) {
-                    continue;
-                }
-
-                ColorSequence *sequence = lzw_table->sequences[lzw_code];
-
-                // current_sequence is never empty at this point, so memcmp is not going to return 0
-                // for dummy zero-length sequences.
-                assert(current_sequence.count > 0);
-
-                // BTW, apparently it is technically a UB to pass NULL to memcmp, as well as for
-                // other string functions, even if the size is 0?
-                //
-                // https://stackoverflow.com/a/16363034
-                // > Unless explicitly stated otherwise in the description of a particular function
-                // > in this subclause, pointer arguments on such a call shall still have valid
-                // > values
-
-                if (memcmp(
-                        current_sequence.indices,
-                        sequence->indices,
-                        (size_t) current_sequence.count
-                    ) == 0
-                ) {
-                    sequence_already_exists = true;
-                    longest_sequence_lzw_code = lzw_code;
-                    break;
-                }
-            }
+            bool sequence_already_exists = lzw_table_get_code(
+                lzw_table,
+                (ColorSequenceNew) {current_sequence.indices, current_sequence.count},
+                &longest_sequence_lzw_code
+            );
 
             if (!sequence_already_exists) {
                 nonexistent_sequence_found = true;
@@ -937,18 +976,28 @@ int main(void) {
         //
         // TODO: Simplify this part given the info above.
 
-        if (nonexistent_sequence_found && lzw_table->count == MAX_LZW_CODE + 1) {
+        if (nonexistent_sequence_found && next_lzw_code > MAX_LZW_CODE) {
             lzw_write_code(&lzw_writer, lzw_clear_code, lzw_code_bit_length);
 
             image_iter = image_iter_rewind;
             current_sequence.count = 1;
 
-            for (LzwCode i = lzw_clear_code + 2; i < lzw_table->count; i += 1) {
-                ColorSequence *sequence = lzw_table->sequences[i];
-                dealloc(sequence, sizeof(ColorSequence) + sequence->count * sizeof(ColorIndex));
+            LzwTableBucket *lzw_table_iter = lzw_table->buckets;
+            while (lzw_table_iter < lzw_table->buckets + countof(lzw_table->buckets)) {
+                if (lzw_table_iter->has_value && lzw_table_iter->sequence.count > 1) {
+                    lzw_table_iter->has_value = false;
+                    lzw_table->sequences_count -= 1;
+                    dealloc(
+                        lzw_table_iter->sequence.indices,
+                        lzw_table_iter->sequence.count * sizeof(ColorIndex)
+                    );
+                }
+
+                lzw_table_iter += 1;
             }
-            lzw_table->count = lzw_clear_code + 2;
+
             lzw_code_bit_length = lzw_code_min_bit_length + 1;
+            next_lzw_code = lzw_clear_code + 2;
 
             continue;
         }
@@ -960,29 +1009,28 @@ int main(void) {
             // length 1 are guaranteed to exist in the table.
 
 
-            if (lzw_table->count != MAX_LZW_CODE + 1) {
-                ColorSequence *new_sequence = alloc(
-                    sizeof(ColorSequence) + current_sequence.count * sizeof(ColorIndex)
-                );
-                new_sequence->count = current_sequence.count;
+            if (next_lzw_code <= MAX_LZW_CODE) {
+                ColorSequenceNew new_sequence = {
+                    .count = current_sequence.count,
+                    .indices = alloc(current_sequence.count * sizeof(ColorIndex)),
+                };
                 memmove(
-                    new_sequence->indices,
+                    new_sequence.indices,
                     current_sequence.indices,
                     (size_t) (current_sequence.count * sizeof(ColorIndex))
                 );
-
-                lzw_table->sequences[lzw_table->count] = new_sequence;
 
                 // Increase the LZW code length here because the spec says so:
                 // > Whenever the LZW code value would exceed the current code length,
                 // > the code length is increased by one. The packing/unpacking of these
                 // > codes must then be altered to reflect the new code length.
 
-                if ((lzw_table->count & (lzw_table->count - 1)) == 0) {
+                if ((next_lzw_code & (next_lzw_code - 1)) == 0) {
                     lzw_code_bit_length += 1;
                 }
 
-                lzw_table->count += 1;
+                lzw_table_insert(lzw_table, new_sequence, next_lzw_code);
+                next_lzw_code += 1;
             }
 
             ColorIndex next_after_existing = current_sequence.indices[current_sequence.count - 1];
