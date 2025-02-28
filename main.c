@@ -408,75 +408,223 @@ f32 f32x3_dot(f32x3 left, f32x3 right) {
 
 #define GIF_MAX_COLORS 256
 
+typedef struct ColorTreeNode ColorTreeNode;
+
+typedef struct {
+    f32x3 color;
+    ColorIndex color_index;
+} IndexedColor;
+
+struct ColorTreeNode {
+    f32 median;
+    ColorTreeNode *left;
+    ColorTreeNode *right;
+    IndexedColor value;
+};
+
+int indexed_color_compare_by_x(void const *left_void, void const *right_void) {
+    f32x3 left = ((IndexedColor *) left_void)->color;
+    f32x3 right = ((IndexedColor *) right_void)->color;
+
+    return (int) copysignf(1.0F, left.x - right.x);
+}
+
+int indexed_color_compare_by_y(void const *left_void, void const *right_void) {
+    f32x3 left = ((IndexedColor *) left_void)->color;
+    f32x3 right = ((IndexedColor *) right_void)->color;
+
+    return (int) copysignf(1.0F, left.y - right.y);
+}
+
+int indexed_color_compare_by_z(void const *left_void, void const *right_void) {
+    f32x3 left = ((IndexedColor *) left_void)->color;
+    f32x3 right = ((IndexedColor *) right_void)->color;
+
+    return (int) copysignf(1.0F, left.z - right.z);
+}
+
+ColorTreeNode *color_tree_construct(
+    IndexedColor *colors,
+    isize colors_count,
+    isize depth,
+    isize index,
+    ColorTreeNode *node_pool
+) {
+    assert(colors_count != 0);
+
+    ColorTreeNode *node = node_pool + index;
+
+    if (colors_count > 1) {
+        isize dimension = depth % 3;
+
+        int (*comparator)(void const *, void const *);
+        switch (dimension) {
+            case 0: comparator = indexed_color_compare_by_x; break;
+            case 1: comparator = indexed_color_compare_by_y; break;
+            case 2: comparator = indexed_color_compare_by_z; break;
+            default: assert(false);
+        }
+        qsort(colors, (size_t) colors_count, sizeof(IndexedColor), comparator);
+
+        // FIXME: Type punning is considered an UB.
+        f32 median = ((f32 *) &colors[colors_count / 2])[dimension];
+
+        // The median value goes into the right subtree.
+        node->median = median;
+
+        node->left = color_tree_construct(
+            colors,
+            colors_count / 2,
+            depth + 1,
+            2 * index,
+            node_pool
+        );
+        node->right = color_tree_construct(
+            colors + colors_count / 2,
+            colors_count - colors_count / 2,
+            depth + 1,
+            2 * index + 1,
+            node_pool
+        );
+    } else {
+        // Both are NULL -> leaf node.
+        node->left = NULL;
+        node->right = NULL;
+
+        node->value = colors[0];
+    }
+
+    return node;
+}
+
+void color_tree_get_nearest(
+    ColorTreeNode *node,
+    f32x3 search_color,
+    isize depth,
+    f32 *min_distance,
+    ColorIndex *nearest_color_index
+) {
+    if (node->left != NULL) {
+        isize dimension = depth % 3;
+        // FIXME: UB.
+        f32 dimension_value = ((f32 *) &search_color)[dimension];
+
+        ColorTreeNode *subtree;
+        ColorTreeNode *other_subtree;
+        if (dimension_value < node->median) {
+            subtree = node->left;
+            other_subtree = node->right;
+        } else {
+            subtree = node->right;
+            other_subtree = node->left;
+        }
+
+        color_tree_get_nearest(
+            subtree,
+            search_color,
+            depth + 1,
+            min_distance,
+            nearest_color_index
+        );
+
+        if (fabsf(node->median - dimension_value) < *min_distance) {
+            color_tree_get_nearest(
+                other_subtree,
+                search_color,
+                depth + 1,
+                min_distance,
+                nearest_color_index
+            );
+        }
+    } else {
+        // Leaf node
+        // f32x3 distance_vector = f32x3_sub(node->value.color, search_color);
+        // f32 current_distance = sqrtf(f32x3_dot(distance_vector, distance_vector));
+
+        f32 current_distance = sqrtf(
+            (node->value.color.x - search_color.x) * (node->value.color.x - search_color.x) +
+            (node->value.color.y - search_color.y) * (node->value.color.y - search_color.y) +
+            (node->value.color.z - search_color.z) * (node->value.color.z - search_color.z)
+        );
+
+        if (current_distance < *min_distance) {
+            *min_distance = current_distance;
+            *nearest_color_index = node->value.color_index;
+        }
+    }
+}
+
 typedef struct {
     isize count;
     RGB srgb_colors[GIF_MAX_COLORS];
     f32x3 rgb_colors[GIF_MAX_COLORS];
+    ColorTreeNode *root;
 } ColorTable;
 
-void color_table_compute_linear_rgb(ColorTable *color_table) {
-    for (isize color_index = 0; color_index < color_table->count; color_index += 1) {
-        f32x3 rgb = rgb_to_f32x3(color_table->srgb_colors[color_index]);
+void color_table_from_array(RGB *colors, isize colors_count, ColorTable *color_table) {
+    assert(colors_count <= GIF_MAX_COLORS);
+
+    color_table->count = colors_count;
+
+    for (isize color_index = 0; color_index < colors_count; color_index += 1) {
+        f32x3 rgb = rgb_to_f32x3(colors[color_index]);
         color_table->rgb_colors[color_index] = f32x3_pow(rgb, GAMMA);
+        color_table->srgb_colors[color_index] = colors[color_index];
     }
+
+    IndexedColor indexed_colors[GIF_MAX_COLORS];
+    for (isize color_index = 0; color_index < colors_count; color_index += 1) {
+        indexed_colors[color_index].color_index = (ColorIndex) color_index;
+        indexed_colors[color_index].color = color_table->rgb_colors[color_index];
+    }
+
+    ColorTreeNode *node_pool = alloc(2 * GIF_MAX_COLORS * sizeof(ColorTreeNode));
+    color_table->root = color_tree_construct(indexed_colors, color_table->count, 0, 1, node_pool);
 }
 
 void color_table_black_and_white(ColorTable *color_table) {
-    color_table->count = 2;
-    color_table->srgb_colors[0] = rgb(0x00, 0x00, 0x00);
-    color_table->srgb_colors[1] = rgb(0xff, 0xff, 0xff);
+    RGB colors[2];
+    colors[0] = rgb(0x00, 0x00, 0x00);
+    colors[1] = rgb(0xff, 0xff, 0xff);
 
-    color_table_compute_linear_rgb(color_table);
+    color_table_from_array(colors, countof(colors), color_table);
 }
 
 void color_table_monochrome(ColorTable *color_table) {
-    color_table->count = 256;
+    RGB colors[256];
     for (int component = 0x00; component <= 0xff; component += 1) {
-        color_table->srgb_colors[component] = rgb((u8) component, (u8) component, (u8) component);
+        colors[component] = rgb((u8) component, (u8) component, (u8) component);
     }
 
-    color_table_compute_linear_rgb(color_table);
+    color_table_from_array(colors, countof(colors), color_table);
 }
 
 void color_table_web_safe(ColorTable *color_table) {
+    RGB colors[216];
     isize count = 0;
     for (int red = 0x00; red <= 0xff; red += 0x33) {
         for (int green = 0x00; green <= 0xff; green += 0x33) {
             for (int blue = 0x00; blue <= 0xff; blue += 0x33) {
-                assert(count < countof(color_table->srgb_colors));
-                color_table->srgb_colors[count] = rgb((u8) red, (u8) green, (u8) blue);
+                assert(count < countof(colors));
+                colors[count] = rgb((u8) red, (u8) green, (u8) blue);
 
                 count += 1;
             }
         }
     }
 
-    color_table->count = count;
-
-    color_table_compute_linear_rgb(color_table);
+    color_table_from_array(colors, countof(colors), color_table);
 }
 
 ColorIndex color_table_get_index(ColorTable *color_table, RGB needle) {
     f32x3 needle_vector = rgb_to_f32x3(needle);
     needle_vector = f32x3_pow(needle_vector, GAMMA);
 
-    ColorIndex best_match = 0;
-    f32 best_match_distance = INFINITY;
+    ColorIndex nearest_index;
+    f32 min_distance = INFINITY;
+    color_tree_get_nearest(color_table->root, needle_vector, 0, &min_distance, &nearest_index);
 
-    f32x3 *color_iter = color_table->rgb_colors;
-    while (color_iter < color_table->rgb_colors + color_table->count) {
-        f32x3 distance_vector = f32x3_sub(*color_iter, needle_vector);
-        f32 distance = f32x3_dot(distance_vector, distance_vector);
-
-        if (distance < best_match_distance) {
-            best_match = (ColorIndex) (color_iter - color_table->rgb_colors);
-            best_match_distance = distance;
-        }
-
-        color_iter += 1;
-    }
-
-    return best_match;
+    return nearest_index;
 }
 
 typedef struct {
@@ -591,6 +739,7 @@ int rgb_compare_blue_only(void const *left_ptr, void const *right_ptr) {
 
 void color_table_median_cut(Image *image, isize target_colors_count, ColorTable *color_table) {
     assert(target_colors_count <= GIF_MAX_COLORS);
+    RGB quantized_colors[GIF_MAX_COLORS];
 
     RGB *colors;
     RGB *colors_end;
@@ -714,9 +863,7 @@ void color_table_median_cut(Image *image, isize target_colors_count, ColorTable 
         queue.count += 2;
     }
 
-    color_table->count = queue.count;
-
-    RGB *color_table_iter = color_table->srgb_colors;
+    RGB *quantized_colors_iter = quantized_colors;
     isize segment_index = queue.first_index;
 
     while (true) {
@@ -743,18 +890,18 @@ void color_table_median_cut(Image *image, isize target_colors_count, ColorTable 
             (u8) (green_sum / colors_count),
             (u8) (blue_sum / colors_count)
         );
-        *color_table_iter = average;
+        *quantized_colors_iter = average;
 
         if (segment_index == queue.last_index) {
             break;
         }
-        color_table_iter += 1;
+        quantized_colors_iter += 1;
         segment_index = (segment_index + 1) % countof(queue.segments);
     }
 
     dealloc(colors, (colors_end - colors) * sizeof(RGB));
 
-    color_table_compute_linear_rgb(color_table);
+    color_table_from_array(quantized_colors, queue.count, color_table);
 }
 
 int main(void) {
