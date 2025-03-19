@@ -1,4 +1,5 @@
-// $ cc -DNDEBUG -O2 -lm main.c
+// $ cc -DNDEBUG -O2 -c image_load.c -o image_load.o
+// $ cc -DNDEBUG -O2 -lm image_load.o main.c
 //
 // GIF references:
 // - https://www.w3.org/Graphics/GIF/spec-gif89a.txt
@@ -7,7 +8,6 @@
 // TODO: Come up with a GIF encoder interface and extract it into a separate file.
 
 #include <stdio.h>      // FILE, fopen, fclose, fwrite, stderr, fprintf
-#include <stdint.h>     // uint8_t, uint16_t, uint32_t, ptrdiff_t
 #include <stddef.h>     // size_t, NULL
 #include <stdlib.h>     // malloc, realloc, free, abort
 #include <string.h>     // memmove, memcmp, memset
@@ -16,26 +16,8 @@
 #include <math.h>       // powf, INFINITY
 #include <stdarg.h>     // va_list, va_start, va_end, va_arg
 
-// TODO: Extract stb_image into a separate translation unit, because it blows up compilation times
-// quite a bit with optimizations enabled.
-
-// Only used to decode the input image.
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-
-#define UNUSED(x) ((void) (x))
-
-typedef uint8_t u8;
-typedef uint16_t u16;
-typedef int32_t i32;
-typedef uint32_t u32;
-typedef ptrdiff_t isize;
-typedef float f32;
-
-#define FMT_ISIZE "%td"
-
-#define sizeof(expr) ((isize) sizeof(expr))
-#define countof(expr) (sizeof(expr) / sizeof((expr)[0]))
+#include "common.h"
+#include "image_load.h"
 
 static inline u8 *u8_write(u8 value, u8 *dest) {
     dest[0] = value;
@@ -803,12 +785,6 @@ void color_set_destroy(ColorSet *colors) {
     colors->colors_count = 0;
 }
 
-typedef struct {
-    u8 *data;
-    isize size;
-    isize bytes_per_pixel;
-} Image;
-
 int rgb_compare_red_only(void const *left_ptr, void const *right_ptr) {
     RGB left = *((RGB *) left_ptr);
     RGB right = *((RGB *) right_ptr);
@@ -839,7 +815,7 @@ void color_table_median_cut(Image *image, isize target_colors_count, ColorTable 
     {
         ColorSet color_set = {NULL};
         u8 *image_data_iter = image->data;
-        while (image_data_iter < image->data + image->size) {
+        while (image_data_iter < image->data + image_size(image)) {
             RGB color = rgb(
                 image_data_iter[RED_INDEX],
                 image_data_iter[GREEN_INDEX],
@@ -998,31 +974,17 @@ void color_table_median_cut(Image *image, isize target_colors_count, ColorTable 
 }
 
 int main(void) {
-    int image_width;
-    int image_height;
-    int image_bytes_per_pixel;
-    u8 *image = stbi_load("input.jpg", &image_width, &image_height, &image_bytes_per_pixel, 0);
-
-    if (image == NULL) {
-        GIF_ERROR_CALLBACK(GIF_INPUT_IMAGE_READ_ERROR);
-        abort();
-    }
-
-    isize image_buffer_size =
-        (isize) image_width * (isize) image_height * (isize) image_bytes_per_pixel;
+    Image image;
+    image_load("input.jpg", &image);
 
     // TODO: Instead of quantizing the image on the go while encoding the image, convert the whole
     // image to color indices before starting the encoding process.
 
     ColorTable color_table;
-    color_table_median_cut(
-        &(Image) {image, image_buffer_size, image_bytes_per_pixel},
-        GIF_MAX_COLORS,
-        &color_table
-    );
+    color_table_median_cut(&image, GIF_MAX_COLORS, &color_table);
 
-    if (image_width > GIF_MAX_WIDTH || image_height > GIF_MAX_HEIGHT) {
-        GIF_ERROR_CALLBACK(GIF_ERROR_INPUT_IMAGE_TOO_BIG, image_width, image_height);
+    if (image.width > GIF_MAX_WIDTH || image.height > GIF_MAX_HEIGHT) {
+        GIF_ERROR_CALLBACK(GIF_ERROR_INPUT_IMAGE_TOO_BIG, image.width, image.height);
         abort();
     }
 
@@ -1051,8 +1013,8 @@ int main(void) {
     header_iter = u8_write('a', header_iter);
 
     // Logical screen descriptor
-    header_iter = u16_write_le((u16) image_width, header_iter);
-    header_iter = u16_write_le((u16) image_height, header_iter);
+    header_iter = u16_write_le((u16) image.width, header_iter);
+    header_iter = u16_write_le((u16) image.height, header_iter);
 
     if (color_table.count > 256) {
         GIF_ERROR_CALLBACK(GIF_ERROR_COLOR_TABLE_OVERFLOW);
@@ -1114,8 +1076,8 @@ int main(void) {
     image_header_iter = u8_write(0x2c, image_header_iter);
     image_header_iter = u16_write_le(0, image_header_iter);
     image_header_iter = u16_write_le(0, image_header_iter);
-    image_header_iter = u16_write_le((u16) image_width, image_header_iter);
-    image_header_iter = u16_write_le((u16) image_height, image_header_iter);
+    image_header_iter = u16_write_le((u16) image.width, image_header_iter);
+    image_header_iter = u16_write_le((u16) image.height, image_header_iter);
     image_header_iter = u8_write(0x00, image_header_iter);
 
     // Minimum LZW code bit length
@@ -1152,8 +1114,8 @@ int main(void) {
         lzw_table_insert(lzw_table, single_color_sequence, color_index);
     }
 
-    u8 *image_iter = image;
-    u8 *image_end = image + image_buffer_size;
+    u8 *image_iter = image.data;
+    u8 *image_end = image.data + image_size(&image);
 
     ColorArray current_sequence = {NULL};
 
@@ -1163,7 +1125,7 @@ int main(void) {
         u8 red = image_iter[RED_INDEX];
         u8 green = image_iter[GREEN_INDEX];
         u8 blue = image_iter[BLUE_INDEX];
-        image_iter += image_bytes_per_pixel;
+        image_iter += image.bytes_per_pixel;
         color_array_push(&current_sequence, color_table_get_index(&color_table, rgb(red, green, blue)));
     }
 
@@ -1192,7 +1154,7 @@ int main(void) {
                 u8 red = image_iter[RED_INDEX];
                 u8 green = image_iter[GREEN_INDEX];
                 u8 blue = image_iter[BLUE_INDEX];
-                image_iter += image_bytes_per_pixel;
+                image_iter += image.bytes_per_pixel;
 
                 color_array_push(
                     &current_sequence,
