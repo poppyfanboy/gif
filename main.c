@@ -6,7 +6,7 @@
 
 // TODO: Come up with a GIF encoder interface and extract it into a separate file.
 
-#include <stdio.h>      // FILE, fopen, fclose, fwrite
+#include <stdio.h>      // FILE, fopen, fclose, fwrite, stderr, fprintf
 #include <stdint.h>     // uint8_t, uint16_t, uint32_t, ptrdiff_t
 #include <stddef.h>     // size_t, NULL
 #include <stdlib.h>     // malloc, realloc, free, abort
@@ -14,6 +14,10 @@
 #include <stdbool.h>    // true, false, bool
 #include <assert.h>     // assert
 #include <math.h>       // powf, INFINITY
+#include <stdarg.h>     // va_list, va_start, va_end, va_arg
+
+// TODO: Extract stb_image into a separate translation unit, because it blows up compilation times
+// quite a bit with optimizations enabled.
 
 // Only used to decode the input image.
 #define STB_IMAGE_IMPLEMENTATION
@@ -23,9 +27,12 @@
 
 typedef uint8_t u8;
 typedef uint16_t u16;
+typedef int32_t i32;
 typedef uint32_t u32;
 typedef ptrdiff_t isize;
 typedef float f32;
+
+#define FMT_ISIZE "%td"
 
 #define sizeof(expr) ((isize) sizeof(expr))
 #define countof(expr) (sizeof(expr) / sizeof((expr)[0]))
@@ -41,13 +48,106 @@ static inline u8 *u16_write_le(u16 value, u8 *dest) {
     return dest + 2;
 }
 
-static inline u8 u8_min(u8 a, u8 b) {
-    return a < b ? a : b;
+static inline u8 u8_min(u8 lhs, u8 rhs) {
+    return lhs < rhs ? lhs : rhs;
 }
 
-static inline u8 u8_max(u8 a, u8 b) {
-    return a > b ? a : b;
+static inline u8 u8_max(u8 lhs, u8 rhs) {
+    return lhs > rhs ? lhs : rhs;
 }
+
+static inline i32 u32_clz(u32 value) {
+#if defined(__clang__) || defined(__GNUC__)
+    return __builtin_clz(value);
+#elif defined(_MSC_VER)
+    return (i32) __lzcnt(value);
+#else
+    i32 result = 0;
+    if ((value & 0xffff0000) == 0) {
+        result += 16;
+        value <<= 16;
+    }
+    if ((value & 0xff000000) == 0) {
+        result += 8;
+        value <<= 8;
+    }
+    if ((value & 0xf0000000) == 0) {
+        result += 4;
+        value <<= 4;
+    }
+    if ((value & 0xc0000000) == 0) {
+        result += 2;
+        value <<= 2;
+    }
+    if ((value & 0x80000000) == 0) {
+        result += 1;
+    }
+    return result;
+#endif
+}
+
+i32 i32_log2_ceil(i32 value) {
+    assert(value > 0);
+
+    i32 log2_ceil = sizeof(u32) * 8 - u32_clz((u32) value);
+    if ((value & (value - 1)) == 0) {
+        log2_ceil -= 1;
+    }
+
+    return log2_ceil;
+}
+
+typedef enum {
+    GIF_OUTPUT_IMAGE_WRITE_ERROR,
+    GIF_OUT_OF_MEMORY,
+    GIF_INPUT_IMAGE_READ_ERROR,
+    GIF_ERROR_INPUT_IMAGE_TOO_BIG,
+    GIF_ERROR_COLOR_TABLE_OVERFLOW,
+} GifErrorKind;
+
+// Any additional info associated with the error is passed through the variadic parameters.
+void gif_error_callback_impl(GifErrorKind error_kind, ...) {
+    va_list error_data;
+
+    switch (error_kind) {
+    case GIF_OUTPUT_IMAGE_WRITE_ERROR: {
+        fprintf(stderr, "[ERROR] Failed to write the output image.\n");
+    } break;
+
+    case GIF_OUT_OF_MEMORY: {
+        fprintf(stderr, "[ERROR] Out of memory.\n");
+    } break;
+
+    case GIF_INPUT_IMAGE_READ_ERROR: {
+        fprintf(stderr, "[ERROR] Failed to read the input image.\n");
+    } break;
+
+    case GIF_ERROR_INPUT_IMAGE_TOO_BIG: {
+        va_start(error_data, error_kind);
+        isize input_image_width = va_arg(error_data, isize);
+        isize input_image_height = va_arg(error_data, isize);
+
+        fprintf(
+            stderr,
+            "[ERROR] Input image dimensions ("FMT_ISIZE"x"FMT_ISIZE") are too big for a GIF.\n",
+            input_image_width,
+            input_image_height
+        );
+
+        va_end(error_data);
+    } break;
+
+    case GIF_ERROR_COLOR_TABLE_OVERFLOW: {
+        fprintf(stderr, "[ERROR] GIF color table overflow.\n");
+    } break;
+    }
+}
+
+#ifdef NDEBUG
+    #define GIF_ERROR_CALLBACK(error_kind, ...)
+#else
+    #define GIF_ERROR_CALLBACK gif_error_callback_impl
+#endif
 
 void file_write_all(FILE *file, u8 const *source, isize size) {
     isize bytes_written = (isize) fwrite(source, 1, (size_t) size, file);
@@ -60,7 +160,7 @@ void file_write_all(FILE *file, u8 const *source, isize size) {
     // Which means that (size != bytes_written) indicates an error while writing to the file.
 
     if (size != bytes_written) {
-        // Failed to write to the output file.
+        GIF_ERROR_CALLBACK(GIF_OUTPUT_IMAGE_WRITE_ERROR);
         abort();
     }
 }
@@ -81,7 +181,7 @@ void *alloc(isize size) {
 
     void *memory = malloc((size_t) size);
     if (memory == NULL) {
-        // Out of memory.
+        GIF_ERROR_CALLBACK(GIF_OUT_OF_MEMORY);
         abort();
     }
 
@@ -113,7 +213,7 @@ void *alloc_resize(void *memory, isize old_size, isize new_size) {
 
     void *resized_memory = realloc(memory, (size_t) new_size);
     if (resized_memory == NULL) {
-        // Out of memory.
+        GIF_ERROR_CALLBACK(GIF_OUT_OF_MEMORY);
         abort();
     }
 
@@ -125,13 +225,12 @@ void *alloc_resize(void *memory, isize old_size, isize new_size) {
 
 typedef u8 ColorIndex;
 
-// TODO: Rename back to ColorSequenceNew once I finish fixing the errors.
 typedef struct {
     ColorIndex *indices;
     isize count;
-} ColorSequenceNew;
+} ColorSequence;
 
-u32 color_sequence_hash(ColorSequenceNew sequence) {
+u32 color_sequence_hash(ColorSequence sequence) {
     u32 hash = 5381;
 
     ColorIndex *sequence_iter = sequence.indices;
@@ -144,7 +243,7 @@ u32 color_sequence_hash(ColorSequenceNew sequence) {
     return hash;
 }
 
-bool color_sequence_equals(ColorSequenceNew left, ColorSequenceNew right) {
+bool color_sequence_equals(ColorSequence left, ColorSequence right) {
     assert(left.count != 0 || right.count != 0);
 
     if (left.count != right.count) {
@@ -190,11 +289,11 @@ typedef isize LzwCode;
 #define MAX_LZW_CODE 4095
 #define LZW_CODE_MAX_BIT_LENGTH 12
 
-// TODO: Encode the "exists" flag into the sequence pointer? Or even into the LZW code?
-
+// Key = ColorSequence
+// Value = LzwCode
+// An empty color sequence indicates an empty bucket.
 typedef struct {
-    bool has_value;
-    ColorSequenceNew sequence;
+    ColorSequence sequence;
     LzwCode code;
 } LzwTableBucket;
 
@@ -210,37 +309,37 @@ LzwTable *lzw_table_create(void) {
     return lzw_table;
 }
 
-void lzw_table_insert(LzwTable *lzw_table, ColorSequenceNew new_sequence, LzwCode new_code) {
+void lzw_table_insert(LzwTable *lzw_table, ColorSequence new_sequence, LzwCode new_code) {
+    assert(new_sequence.count > 0);
     assert(lzw_table->sequences_count < countof(lzw_table->buckets));
 
     isize bucket_index = color_sequence_hash(new_sequence) % countof(lzw_table->buckets);
-    while (lzw_table->buckets[bucket_index].has_value) {
+    while (lzw_table->buckets[bucket_index].sequence.count > 0) {
         assert(!color_sequence_equals(new_sequence, lzw_table->buckets[bucket_index].sequence));
 
         bucket_index = (bucket_index + 1) % countof(lzw_table->buckets);
     }
 
-    lzw_table->buckets[bucket_index].has_value = true;
     lzw_table->buckets[bucket_index].sequence = new_sequence;
     lzw_table->buckets[bucket_index].code = new_code;
 
     lzw_table->sequences_count += 1;
 }
 
-bool lzw_table_get_code(LzwTable *lzw_table, ColorSequenceNew needle_sequence, LzwCode *code) {
+bool lzw_table_get_code(LzwTable *lzw_table, ColorSequence needle_sequence, LzwCode *code) {
     isize bucket_index = color_sequence_hash(needle_sequence) % countof(lzw_table->buckets);
     while (
-        lzw_table->buckets[bucket_index].has_value &&
+        lzw_table->buckets[bucket_index].sequence.count > 0 &&
         !color_sequence_equals(needle_sequence, lzw_table->buckets[bucket_index].sequence)
     ) {
         bucket_index = (bucket_index + 1) % countof(lzw_table->buckets);
     }
 
-    if (!lzw_table->buckets[bucket_index].has_value) {
-        return false;
-    } else {
+    if (lzw_table->buckets[bucket_index].sequence.count > 0) {
         *code = lzw_table->buckets[bucket_index].code;
         return true;
+    } else {
+        return false;
     }
 }
 
@@ -443,16 +542,10 @@ int indexed_color_compare_by_z(void const *left_void, void const *right_void) {
     return (int) copysignf(1.0F, left.z - right.z);
 }
 
-ColorTreeNode *color_tree_construct(
-    IndexedColor *colors,
-    isize colors_count,
-    isize depth,
-    isize index,
-    ColorTreeNode *node_pool
-) {
+ColorTreeNode *color_tree_construct(IndexedColor *colors, isize colors_count, isize depth) {
     assert(colors_count != 0);
 
-    ColorTreeNode *node = node_pool + index;
+    ColorTreeNode *node = alloc(sizeof(ColorTreeNode));
 
     if (colors_count > 1) {
         isize dimension = depth % 3;
@@ -466,25 +559,25 @@ ColorTreeNode *color_tree_construct(
         }
         qsort(colors, (size_t) colors_count, sizeof(IndexedColor), comparator);
 
-        // FIXME: Type punning is considered an UB.
-        f32 median = ((f32 *) &colors[colors_count / 2])[dimension];
+        IndexedColor median_color = colors[colors_count / 2];
+        f32 median_color_array[3] = {
+            median_color.color.x,
+            median_color.color.y,
+            median_color.color.z,
+        };
 
         // The median value goes into the right subtree.
-        node->median = median;
+        node->median = median_color_array[dimension];
 
         node->left = color_tree_construct(
             colors,
             colors_count / 2,
-            depth + 1,
-            2 * index,
-            node_pool
+            depth + 1
         );
         node->right = color_tree_construct(
             colors + colors_count / 2,
             colors_count - colors_count / 2,
-            depth + 1,
-            2 * index + 1,
-            node_pool
+            depth + 1
         );
     } else {
         // Both are NULL -> leaf node.
@@ -504,10 +597,11 @@ void color_tree_get_nearest(
     f32 *min_distance,
     ColorIndex *nearest_color_index
 ) {
+    f32 search_color_array[3] = {search_color.x, search_color.y, search_color.z};
+
     if (node->left != NULL) {
         isize dimension = depth % 3;
-        // FIXME: UB.
-        f32 dimension_value = ((f32 *) &search_color)[dimension];
+        f32 dimension_value = search_color_array[dimension];
 
         ColorTreeNode *subtree;
         ColorTreeNode *other_subtree;
@@ -578,8 +672,7 @@ void color_table_from_array(RGB *colors, isize colors_count, ColorTable *color_t
         indexed_colors[color_index].color = color_table->rgb_colors[color_index];
     }
 
-    ColorTreeNode *node_pool = alloc(2 * GIF_MAX_COLORS * sizeof(ColorTreeNode));
-    color_table->root = color_tree_construct(indexed_colors, color_table->count, 0, 1, node_pool);
+    color_table->root = color_tree_construct(indexed_colors, color_table->count, 0);
 }
 
 void color_table_black_and_white(ColorTable *color_table) {
@@ -911,12 +1004,15 @@ int main(void) {
     u8 *image = stbi_load("input.jpg", &image_width, &image_height, &image_bytes_per_pixel, 0);
 
     if (image == NULL) {
-        // Failed to load an image.
+        GIF_ERROR_CALLBACK(GIF_INPUT_IMAGE_READ_ERROR);
         abort();
     }
 
     isize image_buffer_size =
         (isize) image_width * (isize) image_height * (isize) image_bytes_per_pixel;
+
+    // TODO: Instead of quantizing the image on the go while encoding the image, convert the whole
+    // image to color indices before starting the encoding process.
 
     ColorTable color_table;
     color_table_median_cut(
@@ -926,13 +1022,13 @@ int main(void) {
     );
 
     if (image_width > GIF_MAX_WIDTH || image_height > GIF_MAX_HEIGHT) {
-        // Image dimensions are too big for a GIF.
+        GIF_ERROR_CALLBACK(GIF_ERROR_INPUT_IMAGE_TOO_BIG, image_width, image_height);
         abort();
     }
 
     FILE *output_file = fopen("out.gif", "wb");
     if (output_file == NULL) {
-        // Failed to open an output file.
+        GIF_ERROR_CALLBACK(GIF_OUTPUT_IMAGE_WRITE_ERROR);
         abort();
     }
 
@@ -958,23 +1054,18 @@ int main(void) {
     header_iter = u16_write_le((u16) image_width, header_iter);
     header_iter = u16_write_le((u16) image_height, header_iter);
 
-    // FIXME: next_power_of_two is the worst variable name ever.
-    assert(color_table.count > 0);
-    int next_power_of_two =
-        sizeof(unsigned int) * 8 -
-        __builtin_clz((unsigned int) color_table.count);
-    if ((color_table.count & (color_table.count - 1)) == 0) {
-        next_power_of_two -= 1;
-    }
-    if (next_power_of_two < 1) {
-        next_power_of_two = 1;
-    }
-    if (next_power_of_two > 8) {
-        // color table is too big
+    if (color_table.count > 256) {
+        GIF_ERROR_CALLBACK(GIF_ERROR_COLOR_TABLE_OVERFLOW);
         abort();
     }
 
-    header_iter = u8_write(0x80 | (u8) (next_power_of_two - 1), header_iter);
+    i32 color_table_size_log2_ceil = i32_log2_ceil((i32) color_table.count);
+    if (color_table_size_log2_ceil < 1) {
+        color_table_size_log2_ceil = 1;
+    }
+    assert(1 <= color_table_size_log2_ceil && color_table_size_log2_ceil <= 8);
+
+    header_iter = u8_write(0x80 | (u8) (color_table_size_log2_ceil - 1), header_iter);
 
     header_iter = u8_write(0, header_iter);
     header_iter = u8_write(0, header_iter);
@@ -983,7 +1074,7 @@ int main(void) {
     {
         RGB *color_iter = color_table.srgb_colors;
 
-        for (isize i = 0; i < (1 << next_power_of_two); i += 1) {
+        for (isize i = 0; i < (1 << color_table_size_log2_ceil); i += 1) {
             if (color_iter < color_table.srgb_colors + color_table.count) {
                 header_iter = u8_write((*color_iter >> RED_SHIFT) & 0xff, header_iter);
                 header_iter = u8_write((*color_iter >> GREEN_SHIFT) & 0xff, header_iter);
@@ -1028,8 +1119,7 @@ int main(void) {
     image_header_iter = u8_write(0x00, image_header_iter);
 
     // Minimum LZW code bit length
-    // TODO: This value should be computed from the size of the color table.
-    isize lzw_code_min_bit_length = next_power_of_two;
+    isize lzw_code_min_bit_length = color_table_size_log2_ceil;
     *(image_header_iter++) = (u8) lzw_code_min_bit_length;
 
     file_write_all(output_file, image_header, image_header_iter - image_header);
@@ -1052,8 +1142,8 @@ int main(void) {
 
     LzwTable *lzw_table = lzw_table_create();
 
-    for (isize color_index = 0; color_index < (1 << next_power_of_two); color_index += 1) {
-        ColorSequenceNew single_color_sequence = {
+    for (isize color_index = 0; color_index < (1 << color_table_size_log2_ceil); color_index += 1) {
+        ColorSequence single_color_sequence = {
             .count = 1,
             .indices = alloc(sizeof(ColorIndex))
         };
@@ -1068,8 +1158,6 @@ int main(void) {
     ColorArray current_sequence = {NULL};
 
     assert(image_end - image_iter > 0);
-
-    // TODO: Abstract away looking up color indices from the color table.
 
     {
         u8 red = image_iter[RED_INDEX];
@@ -1091,7 +1179,7 @@ int main(void) {
 
             bool sequence_already_exists = lzw_table_get_code(
                 lzw_table,
-                (ColorSequenceNew) {current_sequence.indices, current_sequence.count},
+                (ColorSequence) {current_sequence.indices, current_sequence.count},
                 &longest_sequence_lzw_code
             );
 
@@ -1119,9 +1207,7 @@ int main(void) {
         // > to it until the encoder chooses to clear it. The encoder during this time sends out
         // > codes that are of the maximum Code Size.
         //
-        // Which means that you don't have to necessarily emit the clear code here?
-        //
-        // TODO: Simplify this part given the info above.
+        // Which means that you don't have to necessarily emit the clear code here.
 
         if (nonexistent_sequence_found && next_lzw_code > MAX_LZW_CODE) {
             lzw_write_code(&lzw_writer, lzw_clear_code, lzw_code_bit_length);
@@ -1131,13 +1217,14 @@ int main(void) {
 
             LzwTableBucket *lzw_table_iter = lzw_table->buckets;
             while (lzw_table_iter < lzw_table->buckets + countof(lzw_table->buckets)) {
-                if (lzw_table_iter->has_value && lzw_table_iter->sequence.count > 1) {
-                    lzw_table_iter->has_value = false;
+                if (lzw_table_iter->sequence.count > 1) {
                     lzw_table->sequences_count -= 1;
                     dealloc(
                         lzw_table_iter->sequence.indices,
                         lzw_table_iter->sequence.count * sizeof(ColorIndex)
                     );
+                    lzw_table_iter->sequence.count = 0;
+                    lzw_table_iter->sequence.indices = NULL;
                 }
 
                 lzw_table_iter += 1;
@@ -1157,7 +1244,7 @@ int main(void) {
 
 
             if (next_lzw_code <= MAX_LZW_CODE) {
-                ColorSequenceNew new_sequence = {
+                ColorSequence new_sequence = {
                     .count = current_sequence.count,
                     .indices = alloc(current_sequence.count * sizeof(ColorIndex)),
                 };
