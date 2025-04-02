@@ -806,7 +806,12 @@ int rgb_compare_blue_only(void const *left_ptr, void const *right_ptr) {
     return (int) ((left >> BLUE_SHIFT) & 0xff) - (int) ((right >> BLUE_SHIFT) & 0xff);
 }
 
-void color_table_median_cut(Image *image, isize target_colors_count, ColorTable *color_table) {
+void color_table_median_cut(
+    u8 const *image_data,
+    isize image_pixel_count,
+    isize target_colors_count,
+    ColorTable *color_table
+) {
     assert(target_colors_count <= GIF_MAX_COLORS);
     RGB quantized_colors[GIF_MAX_COLORS];
 
@@ -814,8 +819,8 @@ void color_table_median_cut(Image *image, isize target_colors_count, ColorTable 
     RGB *colors_end;
     {
         ColorSet color_set = {NULL};
-        u8 *image_data_iter = image->data;
-        while (image_data_iter < image->data + image_size(image)) {
+        u8 const *image_data_iter = image_data;
+        while (image_data_iter < image_data + image_pixel_count * IMAGE_BYTES_PER_PIXEL) {
             RGB color = rgb(
                 image_data_iter[RED_INDEX],
                 image_data_iter[GREEN_INDEX],
@@ -823,7 +828,7 @@ void color_table_median_cut(Image *image, isize target_colors_count, ColorTable 
             );
             color_set_insert(&color_set, color);
 
-            image_data_iter += image->bytes_per_pixel;
+            image_data_iter += IMAGE_BYTES_PER_PIXEL;
         }
 
         colors = alloc(color_set.colors_count * sizeof(RGB));
@@ -973,18 +978,42 @@ void color_table_median_cut(Image *image, isize target_colors_count, ColorTable 
     color_table_from_array(quantized_colors, queue.count, color_table);
 }
 
+// Any arena-like struct could be used with IMAGE_LOAD:
+typedef struct {
+    isize capacity;
+    u8 *begin;
+    u8 *end;
+} Arena;
+
 int main(void) {
-    Image image;
-    image_load("input.jpg", &image);
+    Arena arena;
+    arena.capacity = 64 * 1024 * 1024;
+    arena.begin = alloc(arena.capacity);
+    arena.end = arena.begin + arena.capacity;
+
+    isize image_width;
+    isize image_height;
+    u8 *image_data = IMAGE_LOAD("input.jpg", &image_width, &image_height, &arena);
+
+    printf(
+        "[INFO] Memory usage: %.1fMiB / %1.fMiB\n",
+        (f32) (arena.capacity - (arena.end - arena.begin)) * 0x1p-20,
+        (f32) arena.capacity * 0x1p-20
+    );
+
+    if (image_data == NULL) {
+        GIF_ERROR_CALLBACK(GIF_INPUT_IMAGE_READ_ERROR);
+        abort();
+    }
 
     // TODO: Instead of quantizing the image on the go while encoding the image, convert the whole
     // image to color indices before starting the encoding process.
 
     ColorTable color_table;
-    color_table_median_cut(&image, GIF_MAX_COLORS, &color_table);
+    color_table_median_cut(image_data, image_width * image_height, GIF_MAX_COLORS, &color_table);
 
-    if (image.width > GIF_MAX_WIDTH || image.height > GIF_MAX_HEIGHT) {
-        GIF_ERROR_CALLBACK(GIF_ERROR_INPUT_IMAGE_TOO_BIG, image.width, image.height);
+    if (image_width > GIF_MAX_WIDTH || image_height > GIF_MAX_HEIGHT) {
+        GIF_ERROR_CALLBACK(GIF_ERROR_INPUT_IMAGE_TOO_BIG, image_width, image_height);
         abort();
     }
 
@@ -1013,8 +1042,8 @@ int main(void) {
     header_iter = u8_write('a', header_iter);
 
     // Logical screen descriptor
-    header_iter = u16_write_le((u16) image.width, header_iter);
-    header_iter = u16_write_le((u16) image.height, header_iter);
+    header_iter = u16_write_le((u16) image_width, header_iter);
+    header_iter = u16_write_le((u16) image_height, header_iter);
 
     if (color_table.count > 256) {
         GIF_ERROR_CALLBACK(GIF_ERROR_COLOR_TABLE_OVERFLOW);
@@ -1076,8 +1105,8 @@ int main(void) {
     image_header_iter = u8_write(0x2c, image_header_iter);
     image_header_iter = u16_write_le(0, image_header_iter);
     image_header_iter = u16_write_le(0, image_header_iter);
-    image_header_iter = u16_write_le((u16) image.width, image_header_iter);
-    image_header_iter = u16_write_le((u16) image.height, image_header_iter);
+    image_header_iter = u16_write_le((u16) image_width, image_header_iter);
+    image_header_iter = u16_write_le((u16) image_height, image_header_iter);
     image_header_iter = u8_write(0x00, image_header_iter);
 
     // Minimum LZW code bit length
@@ -1114,8 +1143,8 @@ int main(void) {
         lzw_table_insert(lzw_table, single_color_sequence, color_index);
     }
 
-    u8 *image_iter = image.data;
-    u8 *image_end = image.data + image_size(&image);
+    u8 *image_iter = image_data;
+    u8 *image_end = image_data + image_width * image_height * IMAGE_BYTES_PER_PIXEL;
 
     ColorArray current_sequence = {NULL};
 
@@ -1125,7 +1154,7 @@ int main(void) {
         u8 red = image_iter[RED_INDEX];
         u8 green = image_iter[GREEN_INDEX];
         u8 blue = image_iter[BLUE_INDEX];
-        image_iter += image.bytes_per_pixel;
+        image_iter += IMAGE_BYTES_PER_PIXEL;
         color_array_push(&current_sequence, color_table_get_index(&color_table, rgb(red, green, blue)));
     }
 
@@ -1154,7 +1183,7 @@ int main(void) {
                 u8 red = image_iter[RED_INDEX];
                 u8 green = image_iter[GREEN_INDEX];
                 u8 blue = image_iter[BLUE_INDEX];
-                image_iter += image.bytes_per_pixel;
+                image_iter += IMAGE_BYTES_PER_PIXEL;
 
                 color_array_push(
                     &current_sequence,
