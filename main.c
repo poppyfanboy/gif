@@ -985,18 +985,48 @@ typedef struct {
     u8 *end;
 } Arena;
 
+static inline isize isize_max(isize lhs, isize rhs) {
+    return lhs > rhs ? lhs : rhs;
+}
+
 int main(void) {
+    Arena scratch_arena;
+    scratch_arena.capacity = isize_max(64 * 1024, memory_for_image_size_call());
+    scratch_arena.begin = alloc(scratch_arena.capacity);
+    scratch_arena.end = scratch_arena.begin + scratch_arena.capacity;
+
     Arena arena;
     arena.capacity = 64 * 1024 * 1024;
     arena.begin = alloc(arena.capacity);
     arena.end = arena.begin + arena.capacity;
 
+    FILE *input_file = fopen("input.jpg", "rb");
+    if (input_file == NULL) {
+        GIF_ERROR_CALLBACK(GIF_INPUT_IMAGE_READ_ERROR);
+        abort();
+    }
+
     isize image_width;
     isize image_height;
-    u8 *image_data = IMAGE_LOAD("input.jpg", &image_width, &image_height, &arena);
+    if (!IMAGE_SIZE(input_file, &image_width, &image_height, scratch_arena)) {
+        GIF_ERROR_CALLBACK(GIF_INPUT_IMAGE_READ_ERROR);
+        abort();
+    }
+
+    u8 *image_data = IMAGE_LOAD(input_file, &arena);
 
     printf(
-        "[INFO] Memory usage: %.1fMiB / %1.fMiB\n",
+        "[INFO] Estimated memory usage for JPEG: %.1fMiB / %1.fMiB\n",
+        (f32) max_memory_for_jpeg_image_load_call(input_file, image_width, image_height) * 0x1p-20,
+        (f32) arena.capacity * 0x1p-20
+    );
+    printf(
+        "[INFO] Estimated memory usage for PNG: %.1fMiB / %1.fMiB\n",
+        (f32) max_memory_for_png_image_load_call(input_file, image_width, image_height) * 0x1p-20,
+        (f32) arena.capacity * 0x1p-20
+    );
+    printf(
+        "[INFO] Actual memory usage: %.1fMiB / %1.fMiB\n",
         (f32) (arena.capacity - (arena.end - arena.begin)) * 0x1p-20,
         (f32) arena.capacity * 0x1p-20
     );
