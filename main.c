@@ -1017,7 +1017,7 @@ int main(void) {
 
     printf(
         "[INFO] Estimated memory usage for JPEG: %.1fMiB / %1.fMiB\n",
-        (f32) max_memory_for_jpeg_image_load_call(input_file, image_width, image_height) * 0x1p-20,
+        (f32) max_memory_for_jpeg_image_load_call(image_width, image_height) * 0x1p-20,
         (f32) arena.capacity * 0x1p-20
     );
     printf(
