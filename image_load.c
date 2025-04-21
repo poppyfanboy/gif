@@ -4,6 +4,7 @@
 #include <string.h> // memcpy
 #include <assert.h> // assert
 #include <stdio.h>  // fseek, ftell
+#include <stdlib.h> // abort
 
 #define ARENA_ALIGNMENT 16
 
@@ -12,15 +13,14 @@ static ImageLoadArena *current_arena = NULL;
 static void *arena_alloc(size_t size) {
     assert(current_arena != NULL);
 
-    isize padding = (-((uptr) current_arena->begin)) & (ARENA_ALIGNMENT - 1);
+    isize padding = (~(uptr)current_arena->begin + 1) & (ARENA_ALIGNMENT - 1);
     isize memory_left = current_arena->end - current_arena->begin - padding;
-    if (memory_left < 0 || (size_t) memory_left < size) {
-        // stb_image will fail gracefully and return NULL or false, if we run out of memory.
-        return NULL;
+    if (memory_left < 0 || (size_t)memory_left < size) {
+        abort();
     }
 
     void *ptr = current_arena->begin + padding;
-    current_arena->begin += padding + (isize) size;
+    current_arena->begin += padding + (isize)size;
     return ptr;
 }
 
@@ -28,13 +28,13 @@ static void arena_free(void *ptr) {
     assert(current_arena != NULL);
 
     // Cannot do anything special here, because stb_image does not give us the allocation size.
-    (void) ptr;
+    UNUSED(ptr);
 }
 
 static void *arena_realloc(void *old_ptr, size_t old_size, size_t new_size) {
     assert(current_arena != NULL);
 
-    if ((u8 *) old_ptr + old_size < current_arena->begin) {
+    if ((u8 *)old_ptr + old_size < current_arena->begin) {
         void *new_ptr = arena_alloc(new_size);
         memcpy(new_ptr, old_ptr, old_size);
         return new_ptr;
