@@ -1,7 +1,7 @@
 #ifndef COMMON_H
 #define COMMON_H
 
-#define UNUSED(x) ((void) (x))
+#define UNUSED(x) (void)(x)
 
 // Redefinition of typedefs is a C11 feature.
 // This is the official™ guard, which is used across different headers to protect u8 and friends.
@@ -31,7 +31,7 @@
 
 #define FMT_ISIZE "%td"
 
-#define sizeof(expr) ((isize) sizeof(expr))
+#define sizeof(expr) (isize)sizeof(expr)
 #define countof(expr) (sizeof(expr) / sizeof((expr)[0]))
 
 #endif // COMMON_H

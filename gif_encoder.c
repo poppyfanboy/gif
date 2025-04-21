@@ -1,8 +1,15 @@
 // GIF references:
 // - https://www.w3.org/Graphics/GIF/spec-gif89a.txt
 // - https://en.wikipedia.org/wiki/GIF
-//
+
+// TODO: Fix some pesky bug that triggers "LZW decode failed" when reading "bad.gif" with ffmpeg.
+// TODO: Provide an option to set frame duration (for the whole GIF, in float seconds).
+// TODO: Generated GIFs do not loop when run in browser?
 // TODO: Allow the user to provide frames in small chunks (right now this gives bogus results).
+// TODO: Finish copy-pasting functions from "main.c".
+// TODO: Try converting the input image into LAB or Oklab color spaces before quantization.
+// TODO: Add a function for dithering? I have no idea how it's done though.
+// TODO: Implement something similar to transdiff from ffmpeg.
 
 #include "gif_encoder.h"
 
@@ -912,7 +919,7 @@ void gif_encoder_start_frame(
     // D: Whether transparency is enabled
     out_iter += u8_write(0x08, out_iter);
     // Frame delay measured in 1/100ths of a second
-    out_iter += u16_write_le(100, out_iter);
+    out_iter += u16_write_le(10, out_iter);
     // Transparent color index (only matters if transparency is enabled)
     out_iter += u8_write(0, out_iter);
     // Terminator (a zero-size data block)
