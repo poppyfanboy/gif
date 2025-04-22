@@ -91,12 +91,13 @@ void srgb_to_oklab(u8 const *srgb_colors, isize color_count, f32 *oklab_colors);
 void oklab_to_srgb(f32 const *oklab_colors, isize color_count, u8 *srgb_colors);
 
 // Generate a custom color palette that best fits the given image.
-
-void palette_by_median_cut(
+// Returns the actual number of colors generated (<= target_color_count).
+isize palette_by_median_cut(
     f32 const *pixels,
     isize pixel_count,
     f32 *colors,
-    isize target_color_count
+    isize target_color_count,
+    GifArena arena
 );
 
 // Prepare an image to be fed into the GIF encoder.
