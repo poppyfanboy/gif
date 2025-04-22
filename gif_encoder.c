@@ -1,11 +1,8 @@
 // GIF references:
 // - https://www.w3.org/Graphics/GIF/spec-gif89a.txt
 // - https://en.wikipedia.org/wiki/GIF
+// - https://web.archive.org/web/20180620143135/https://www.vurdalakov.net/misc/gif/netscape-looping-application-extension
 
-// TODO: Fix some pesky bug that triggers "LZW decode failed" when reading "bad.gif" with ffmpeg.
-// TODO: Provide an option to set frame duration (for the whole GIF, in float seconds).
-// TODO: Generated GIFs do not loop when run in browser?
-// TODO: Allow the user to provide frames in small chunks (right now this gives bogus results).
 // TODO: Finish copy-pasting functions from "main.c".
 // TODO: Try converting the input image into LAB or Oklab color spaces before quantization.
 // TODO: Add a function for dithering? I have no idea how it's done though.
@@ -16,7 +13,7 @@
 #include <assert.h> // assert
 #include <stdlib.h> // abort, qsort
 #include <stddef.h> // size_t, NULL
-#include <math.h>   // copysignf, powf
+#include <math.h>   // copysignf, powf, roundf
 #include <string.h> // memmove, memset, memcmp
 
 #define UNIMPLEMENTED()                 \
@@ -28,6 +25,7 @@
 #define UNUSED(variable) (void)(variable)
 
 #define sizeof(expr) (isize)sizeof(expr)
+#define lengthof(string) (sizeof(string) - 1)
 
 #define ARENA_ALIGNMENT 16
 
@@ -547,6 +545,7 @@ struct GifEncoder {
 
     isize width;
     isize height;
+    u16 frame_delay;
 
     // These are the actual numbers of colors provided by the user, not the rounded amounts.
     isize global_color_count;
@@ -630,6 +629,9 @@ GifEncoder *gif_encoder_create(GifArena *arena) {
     GifEncoder *encoder = gif_arena_alloc(arena, sizeof(GifEncoder));
     gif_encoder_init(encoder, arena);
 
+    // Amounts to a delay of 1 second.
+    encoder->frame_delay = 100;
+
     return encoder;
 }
 
@@ -688,8 +690,15 @@ static inline bool isize_power_of_two(isize value) {
 static inline isize gif_color_count_round_up(isize color_count) {
     if (color_count == 0) {
         return 0;
-    } else if (color_count < 2) {
-        return 2;
+    } else if (color_count <= 2) {
+        // From Appendix F of GIF89a specification:
+        // The first byte of the Compressed Data stream is a value indicating the minimum number of
+        // bits required to represent the set of actual pixel values. Normally this will be the same
+        // as the number of color bits. Because of some algorithmic constraints however, black &
+        // white images which have one color bit must be indicated as having a code size of 2.
+        //
+        // 4 because log₂(4) is equal to 2.
+        return 4;
     } else {
         return 1 << u32_log2_ceil((u32)color_count);
     }
@@ -719,8 +728,9 @@ void gif_encoder_start(
     // 6 bytes          for the "GIF89a" header
     // 7 bytes          for a logical screen descriptor
     // 256 * 3 bytes    for a max size global color table
+    // 19 bytes         for the Netscape Looping Application Extension
     // -----------------
-    // 781 bytes
+    // 800 bytes
 
     // GIF89a magic
 
@@ -770,6 +780,27 @@ void gif_encoder_start(
         }
     }
 
+    // Netscape Looping Application Extension
+    // https://web.archive.org/web/20180620143135/https://www.vurdalakov.net/misc/gif/netscape-looping-application-extension
+
+    // Extension introducer
+    out_iter += u8_write(0x21, out_iter);
+    // Application extension label
+    out_iter += u8_write(0xff, out_iter);
+    // Extension size + data
+    {
+        char extension_data[] = "NETSCAPE2.0";
+        out_iter += u8_write(lengthof(extension_data), out_iter);
+        memcpy(out_iter, extension_data, 11);
+        out_iter += lengthof(extension_data);
+    }
+    // Data sub-blocks
+    out_iter += u8_write(3, out_iter);
+    out_iter += u8_write(0x01, out_iter);
+    // Loop count (0 for infinity)
+    out_iter += u16_write_le(0, out_iter);
+    out_iter += u8_write(0, out_iter);
+
     // Update the output buffer
 
     assert(out_iter <= out_buffer->data + out_buffer->capacity);
@@ -782,6 +813,13 @@ void gif_encoder_start(
     encoder->width = width;
     encoder->height = height;
     encoder->global_color_count = global_color_count;
+}
+
+void gif_frame_delay(GifEncoder *encoder, f32 seconds) {
+    encoder->frame_delay = (u16)(roundf(seconds * 100.0F));
+    if (encoder->frame_delay == 0) {
+        encoder->frame_delay = 1;
+    }
 }
 
 static void gif_encoder_write_lzw_code(
@@ -919,7 +957,7 @@ void gif_encoder_start_frame(
     // D: Whether transparency is enabled
     out_iter += u8_write(0x08, out_iter);
     // Frame delay measured in 1/100ths of a second
-    out_iter += u16_write_le(10, out_iter);
+    out_iter += u16_write_le(encoder->frame_delay, out_iter);
     // Transparent color index (only matters if transparency is enabled)
     out_iter += u8_write(0, out_iter);
     // Terminator (a zero-size data block)
@@ -1039,7 +1077,7 @@ isize gif_encoder_feed_frame(
     GifColorIndex const *pixel_iter = pixels;
     GifColorIndex const *pixel_end = pixels + pixel_count;
 
-    // This should only happen only once, right after the frame has been started.
+    // This should only happen once, right after the frame has been started.
     //
     // Cannot do this inside of gif_encoder_start_frame, because at that point the image pixels are
     // not available yet.
@@ -1049,7 +1087,7 @@ isize gif_encoder_feed_frame(
         pixel_iter += 1;
     }
 
-    while (pixel_iter < pixel_end || encoder->current_sequence.count > 0) {
+    while (pixel_iter < pixel_end) {
         // Make sure that we will be able to exit this function without a buffer overflow.
         //
         // Conservative check:
@@ -1068,117 +1106,102 @@ isize gif_encoder_feed_frame(
             break;
         }
 
-        assert(encoder->current_sequence.count == 1);
-
-        GifColorIndex const *pixel_iter_rewind = pixel_iter;
-
-        // Assign 0 just to suppress the warning. It should get initialized on the first iteration
-        // of the loop, because the LZW table contains every color sequence of length 1.
-        LzwCode next_lzw_code = 0;
+        // It should get initialized on the first iteration of the loop, because the LZW table
+        // contains every color sequence of length 1.
+        LzwCode next_lzw_code;
+        bool new_sequence_found = !lzw_table_get_code(
+            &encoder->lzw_table,
+            (ColorSequence){encoder->current_sequence.indices, encoder->current_sequence.count},
+            &next_lzw_code
+        );
+        // 1st case: This is the first call to the gif_encoder_feed_frame and we explicitly
+        // initialized current_sequence to the first image pixel. Sequences of size 1 are guaranteed
+        // to exist in the LZW table.
+        //
+        // 2nd case: These are pixels left unencoded after the last call to the
+        // gif_encoder_feed_frame, which means that they are guaranteed to exist in the LZW table
+        // (otherwise we would have had put them into the table).
+        assert(!new_sequence_found);
 
         // Accumulate pixels from the image until we find a sequence which is not yet in the table.
-        bool new_sequence_found = false;
-        while (true) {
-            bool sequence_already_exists = lzw_table_get_code(
+        do {
+            assert(*pixel_iter < color_count);
+            color_array_push(&encoder->current_sequence, *pixel_iter);
+            pixel_iter += 1;
+
+            new_sequence_found = !lzw_table_get_code(
                 &encoder->lzw_table,
                 (ColorSequence){encoder->current_sequence.indices, encoder->current_sequence.count},
                 &next_lzw_code
             );
-            if (!sequence_already_exists) {
-                new_sequence_found = true;
-                break;
-            }
+        } while (pixel_iter < pixel_end && !new_sequence_found);
 
-            if (pixel_iter < pixel_end) {
-                assert(*pixel_iter < color_count);
-                color_array_push(&encoder->current_sequence, *pixel_iter);
-                pixel_iter += 1;
-            } else {
-                break;
-            }
-        }
-
-        // > When the table is full, the encoder can chose to use the table as is, making no changes
-        // > to it until the encoder chooses to clear it. The encoder during this time sends out
-        // > codes that are of the maximum Code Size.
-        //
-        // Which means that you don't have to necessarily emit the clear code here, but clearing the
-        // LZW table usually leads to better compression.
-        //
-        // I don't think we can do this check before searching for the new sequence, because there
-        // is this one corner case when we reached the maximum LZW code, but no new sequence was
-        // found, because we reached the end of the pixels array.
-
-        if (new_sequence_found && encoder->next_available_lzw_code > MAX_LZW_CODE) {
+        if (new_sequence_found) {
             gif_encoder_write_lzw_code(
                 encoder,
-                encoder->lzw_clear_code,
+                next_lzw_code,
                 encoder->lzw_code_bit_length,
                 out_buffer
             );
 
-            pixel_iter = pixel_iter_rewind;
-            encoder->current_sequence.count = 1;
-
-            // Dealloc color sequences and empty the LZW table
-            gif_encoder_reset_lzw_table(encoder);
-
-            encoder->lzw_code_bit_length = encoder->starting_lzw_code_bit_length;
-            encoder->next_available_lzw_code = encoder->starting_lzw_code;
-
-            continue;
-        }
-
-        gif_encoder_write_lzw_code(
-            encoder,
-            next_lzw_code,
-            encoder->lzw_code_bit_length,
-            out_buffer
-        );
-
-        if (new_sequence_found) {
             // All possible sequences of length 1 are guaranteed to already exist in the table.
             assert(encoder->current_sequence.count >= 2);
+            assert(encoder->next_available_lzw_code <= MAX_LZW_CODE);
 
-            if (encoder->next_available_lzw_code <= MAX_LZW_CODE) {
-                GifColorIndex *new_sequence_indices = color_sequence_alloc(
-                    &encoder->color_sequence_arena,
-                    encoder->current_sequence.count
-                );
-                ColorSequence new_sequence = {
-                    .count = encoder->current_sequence.count,
-                    .indices = new_sequence_indices,
-                };
-                memmove(
-                    new_sequence.indices,
-                    encoder->current_sequence.indices,
-                    (size_t)(encoder->current_sequence.count * sizeof(GifColorIndex))
-                );
+            GifColorIndex *new_sequence_indices = color_sequence_alloc(
+                &encoder->color_sequence_arena,
+                encoder->current_sequence.count
+            );
+            ColorSequence new_sequence = {
+                .count = encoder->current_sequence.count,
+                .indices = new_sequence_indices,
+            };
+            memmove(
+                new_sequence.indices,
+                encoder->current_sequence.indices,
+                (size_t)(encoder->current_sequence.count * sizeof(GifColorIndex))
+            );
 
-                // Increase the LZW code length here because the spec says so:
-                // > Whenever the LZW code value would exceed the current code length,
-                // > the code length is increased by one. The packing/unpacking of these
-                // > codes must then be altered to reflect the new code length.
+            // Increase the LZW code length here because the spec says so:
+            // > Whenever the LZW code value would exceed the current code length,
+            // > the code length is increased by one. The packing/unpacking of these
+            // > codes must then be altered to reflect the new code length.
 
-                if (isize_power_of_two(encoder->next_available_lzw_code)) {
-                    encoder->lzw_code_bit_length += 1;
-                }
-
-                lzw_table_insert(
-                    &encoder->lzw_table,
-                    new_sequence,
-                    encoder->next_available_lzw_code
-                );
-                encoder->next_available_lzw_code += 1;
+            if (isize_power_of_two(encoder->next_available_lzw_code)) {
+                encoder->lzw_code_bit_length += 1;
             }
+
+            lzw_table_insert(
+                &encoder->lzw_table,
+                new_sequence,
+                encoder->next_available_lzw_code
+            );
+            encoder->next_available_lzw_code += 1;
 
             GifColorIndex next_after_existing =
                 encoder->current_sequence.indices[encoder->current_sequence.count - 1];
             encoder->current_sequence.count = 1;
             encoder->current_sequence.indices[0] = next_after_existing;
-        } else {
-            assert(pixel_iter == pixel_end);
-            encoder->current_sequence.count = 0;
+
+            // When the table is full, the encoder can chose to use the table as is, making no
+            // changes to it until the encoder chooses to clear it. The encoder during this time
+            // sends out codes that are of the maximum Code Size.
+            //
+            // Which means that you don't have to necessarily emit the clear code here, but clearing
+            // the LZW table usually leads to better compression.
+            if (encoder->next_available_lzw_code > MAX_LZW_CODE) {
+                gif_encoder_write_lzw_code(
+                    encoder,
+                    encoder->lzw_clear_code,
+                    encoder->lzw_code_bit_length,
+                    out_buffer
+                );
+
+                // Dealloc color sequences and empty the LZW table
+                gif_encoder_reset_lzw_table(encoder);
+                encoder->lzw_code_bit_length = encoder->starting_lzw_code_bit_length;
+                encoder->next_available_lzw_code = encoder->starting_lzw_code;
+            }
         }
     }
 
@@ -1188,6 +1211,24 @@ isize gif_encoder_feed_frame(
 void gif_encoder_finish_frame(GifEncoder *encoder, GifOutputBuffer *out_buffer) {
     assert(encoder->state == GIF_ENCODER_FRAME_STARTED);
     assert(gif_out_buffer_capacity_left(out_buffer) >= GIF_OUT_BUFFER_MIN_CAPACITY);
+
+    // Encode the leftover sequence.
+    if (encoder->current_sequence.count > 0) {
+        LzwCode last_lzw_code;
+        bool last_sequence_exists = lzw_table_get_code(
+            &encoder->lzw_table,
+            (ColorSequence){encoder->current_sequence.indices, encoder->current_sequence.count},
+            &last_lzw_code
+        );
+        assert(last_sequence_exists);
+        gif_encoder_write_lzw_code(
+            encoder,
+            last_lzw_code,
+            encoder->lzw_code_bit_length,
+            out_buffer
+        );
+        encoder->current_sequence.count = 0;
+    }
 
     gif_encoder_write_lzw_code(
         encoder,
