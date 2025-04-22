@@ -13,7 +13,7 @@
 #include <assert.h> // assert
 #include <stdlib.h> // abort, qsort
 #include <stddef.h> // size_t, NULL
-#include <math.h>   // copysignf, powf, roundf
+#include <math.h>   // copysignf, powf, roundf, isnan, nanf
 #include <string.h> // memmove, memset, memcmp
 
 #define UNIMPLEMENTED()                 \
@@ -26,6 +26,7 @@
 
 #define sizeof(expr) (isize)sizeof(expr)
 #define lengthof(string) (sizeof(string) - 1)
+#define countof(expr) (sizeof(expr) / sizeof((expr)[0]))
 
 #define ARENA_ALIGNMENT 16
 
@@ -143,10 +144,17 @@ void srgb_to_linear(u8 const *srgb_colors, isize color_count, f32 *linear_colors
 }
 
 void linear_to_srgb(f32 const *linear_colors, isize color_count, u8 *srgb_colors) {
-    UNUSED(linear_colors);
-    UNUSED(color_count);
-    UNUSED(srgb_colors);
-    UNIMPLEMENTED();
+    f32 const *linear_color_iter = linear_colors;
+    u8 *srgb_color_iter = srgb_colors;
+
+    while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
+        srgb_color_iter[0] = (u8)(powf(linear_color_iter[0], 1.0F / GAMMA) * 255.0F);
+        srgb_color_iter[1] = (u8)(powf(linear_color_iter[1], 1.0F / GAMMA) * 255.0F);
+        srgb_color_iter[2] = (u8)(powf(linear_color_iter[2], 1.0F / GAMMA) * 255.0F);
+
+        srgb_color_iter += COMPONENTS_PER_COLOR;
+        linear_color_iter += COMPONENTS_PER_COLOR;
+    }
 }
 
 void srgb_to_lab(u8 const *srgb_colors, isize color_count, f32 *lab_colors) {
@@ -177,24 +185,247 @@ void oklab_to_srgb(f32 const *oklab_colors, isize color_count, u8 *srgb_colors) 
     UNIMPLEMENTED();
 }
 
-void palette_by_median_cut(
-    f32 const *pixels,
-    isize pixel_count,
-    f32 *colors,
-    isize target_color_count
-) {
-    UNUSED(pixels);
-    UNUSED(pixel_count);
-    UNUSED(colors);
-    UNUSED(target_color_count);
-    UNIMPLEMENTED();
-}
-
 typedef struct {
     f32 x;
     f32 y;
     f32 z;
 } f32x3;
+
+// Based on djb2 hashing function:
+// http://www.cse.yorku.ca/~oz/hash.html
+static u32 f32x3_hash(f32x3 value) {
+    u32 hash = 5381;
+
+    u8 const *value_iter = (u8 const *)&value;
+    u8 const *value_end = (u8 const *)&value + sizeof(f32x3);
+    while (value_iter != value_end) {
+        hash = ((hash << 5) + hash) + *value_iter;
+        value_iter += 1;
+    }
+
+    return hash;
+}
+
+static inline bool f32x3_equals(f32x3 left, f32x3 right) {
+    return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
+// First color component set to NaN indicates an empty bucket.
+typedef f32x3 ColorSetBucket;
+
+static inline bool color_set_bucket_empty(ColorSetBucket bucket) {
+    return isnan(bucket.x) || isnan(bucket.y) || isnan(bucket.z);
+}
+
+typedef struct {
+    ColorSetBucket *buckets;
+    isize bucket_count;
+    isize color_count;
+} ColorSet;
+
+static void color_set_insert(ColorSet *colors, f32x3 new_color) {
+    assert(colors->color_count < colors->bucket_count);
+
+    isize bucket_index = f32x3_hash(new_color) % colors->bucket_count;
+    while (
+        !color_set_bucket_empty(colors->buckets[bucket_index]) &&
+        !f32x3_equals(colors->buckets[bucket_index], new_color)
+    ) {
+        bucket_index = (bucket_index + 1) % colors->bucket_count;
+    }
+
+    if (color_set_bucket_empty(colors->buckets[bucket_index])) {
+        colors->buckets[bucket_index] = new_color;
+        colors->color_count += 1;
+    }
+}
+
+static inline isize isize_min(isize left, isize right) {
+    return left < right ? left : right;
+}
+
+static int f32x3_compare_x_only(void const *left_ptr, void const *right_ptr) {
+    f32x3 left = *(f32x3 *)left_ptr;
+    f32x3 right = *(f32x3 *)right_ptr;
+
+    return (int)copysignf(1.0F, left.x - right.x);
+}
+
+static int f32x3_compare_y_only(void const *left_ptr, void const *right_ptr) {
+    f32x3 left = *(f32x3 *)left_ptr;
+    f32x3 right = *(f32x3 *)right_ptr;
+
+    return (int)copysignf(1.0F, left.y - right.y);
+}
+
+static int f32x3_compare_z_only(void const *left_ptr, void const *right_ptr) {
+    f32x3 left = *(f32x3 *)left_ptr;
+    f32x3 right = *(f32x3 *)right_ptr;
+
+    return (int)copysignf(1.0F, left.z - right.z);
+}
+
+isize palette_by_median_cut(
+    f32 const *pixels,
+    isize pixel_count,
+    f32 *palette,
+    isize target_color_count,
+    GifArena arena
+) {
+    assert(target_color_count <= GIF_MAX_COLORS);
+
+    ColorSet color_set;
+    color_set.color_count = 0;
+
+    // TODO: I don't like this hashset capacity estimate, the test image only uses around 2% of the
+    // allocated buckets. And also keep in mind that you will have to iterate over the entire list
+    // of buckets to extract the unique colors. Maybe rehashing here is not a bad idea after all?
+
+    // Worst case scenario: all pixels in the input image are different.
+    color_set.bucket_count = isize_min(pixel_count, 256 * 256 * 256) * 3 / 2;
+    color_set.buckets = gif_arena_alloc(&arena, color_set.bucket_count * sizeof(ColorSetBucket));
+    // If the implementation does not support quiet NaNs, these functions return zero.
+    assert(nanf("") != 0.0F);
+    for (isize i = 0; i < color_set.bucket_count; i += 1) {
+        color_set.buckets[i].x = nanf("");
+        color_set.buckets[i].y = nanf("");
+        color_set.buckets[i].z = nanf("");
+    }
+
+    f32 const *pixel_iter = pixels;
+    f32 const *pixels_end = pixels + COMPONENTS_PER_COLOR * pixel_count;
+    while (pixel_iter < pixels_end) {
+        color_set_insert(&color_set, (f32x3){pixel_iter[0], pixel_iter[1], pixel_iter[2]});
+        pixel_iter += COMPONENTS_PER_COLOR;
+    }
+
+    f32x3 *colors = gif_arena_alloc(&arena, color_set.color_count * sizeof(f32x3));
+    f32x3 *colors_end = colors + color_set.color_count;
+
+    f32x3 *color_iter = colors;
+    ColorSetBucket *bucket_iter = color_set.buckets;
+    while (bucket_iter < color_set.buckets + color_set.bucket_count) {
+        if (!color_set_bucket_empty(*bucket_iter)) {
+            assert(color_iter != colors_end);
+
+            *color_iter = *bucket_iter;
+            color_iter += 1;
+        }
+
+        bucket_iter += 1;
+    }
+    assert(color_iter == colors_end);
+
+    typedef struct {
+        f32x3 *begin;
+        f32x3 *end;
+    } Segment;
+
+    // Ring buffer is used for the queue.
+    typedef struct {
+        isize first_index;
+        isize last_index;
+        isize count;
+        Segment segments[GIF_MAX_COLORS];
+    } SegmentsQueue;
+
+    SegmentsQueue queue;
+    queue.first_index = 0;
+    queue.last_index = 0;
+    queue.count = 1;
+    queue.segments[queue.first_index] = (Segment){colors, colors_end};
+
+    while (queue.count < target_color_count) {
+        assert(queue.count > 0);
+        Segment current_segment = queue.segments[queue.first_index];
+
+        // The image probably has less colors then we are targeting. Break out of the loop because
+        // segments are naturally sorted by their size in decreasing order, so the rest of the
+        // segments are going to be of size 1 as well.
+        if (current_segment.end - current_segment.begin == 1) {
+            break;
+        }
+
+        queue.first_index = (queue.first_index + 1) % countof(queue.segments);
+        queue.count -= 1;
+
+        f32 min_x = 1.0F, min_y = 1.0F, min_z = 1.0F;
+        f32 max_x = 0.0F, max_y = 0.0F, max_z = 0.0F;
+        {
+            f32x3 *colors_iter = current_segment.begin;
+            while (colors_iter != current_segment.end) {
+                min_x = min_x < colors_iter->x ? min_x : colors_iter->x;
+                max_x = max_x > colors_iter->x ? max_x : colors_iter->x;
+
+                min_y = min_y < colors_iter->y ? min_y : colors_iter->y;
+                max_y = max_y > colors_iter->y ? max_y : colors_iter->y;
+
+                min_z = min_z < colors_iter->z ? min_z : colors_iter->z;
+                max_z = max_z > colors_iter->z ? max_z : colors_iter->z;
+
+                colors_iter += 1;
+            }
+        }
+
+        int(*comparator)(void const *, void const *);
+        if (max_x - min_x >= max_y - min_y && max_x - min_x >= max_z - min_z) {
+            comparator = f32x3_compare_x_only;
+        } else if (max_y - min_y >= max_x - min_x && max_y - min_y >= max_z - min_z) {
+            comparator = f32x3_compare_y_only;
+        } else {
+            comparator = f32x3_compare_z_only;
+        }
+        qsort(
+            current_segment.begin,
+            (size_t)(current_segment.end - current_segment.begin),
+            sizeof(f32x3),
+            comparator
+        );
+
+        queue.segments[(queue.last_index + 1) % countof(queue.segments)] = (Segment) {
+            .begin = current_segment.begin,
+            .end = current_segment.begin + (current_segment.end - current_segment.begin) / 2,
+        };
+        queue.segments[(queue.last_index + 2) % countof(queue.segments)] = (Segment) {
+            .begin = current_segment.begin + (current_segment.end - current_segment.begin) / 2,
+            .end = current_segment.end,
+        };
+        queue.last_index = (queue.last_index + 2) % countof(queue.segments);
+        queue.count += 2;
+    }
+
+    f32 *quantized_colors_iter = palette;
+    isize segment_index = queue.first_index;
+
+    while (true) {
+        f64 x_sum = 0;
+        f64 y_sum = 0;
+        f64 z_sum = 0;
+
+        // TODO: Summing up floats like this might be a bad idea?
+        f32x3 *segment_iter = queue.segments[segment_index].begin;
+        while (segment_iter < queue.segments[segment_index].end) {
+            x_sum += segment_iter->x;
+            y_sum += segment_iter->y;
+            z_sum += segment_iter->z;
+
+            segment_iter += 1;
+        }
+
+        isize color_count = queue.segments[segment_index].end - queue.segments[segment_index].begin;
+        quantized_colors_iter[0] = (f32)(x_sum / (f64)color_count);
+        quantized_colors_iter[1] = (f32)(y_sum / (f64)color_count);
+        quantized_colors_iter[2] = (f32)(z_sum / (f64)color_count);
+
+        if (segment_index == queue.last_index) {
+            break;
+        }
+        quantized_colors_iter += COMPONENTS_PER_COLOR;
+        segment_index = (segment_index + 1) % countof(queue.segments);
+    }
+
+    return queue.count;
+}
 
 typedef struct {
     f32x3 color;

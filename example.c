@@ -6,7 +6,7 @@
 #include "image_load.h"
 #include "gif_encoder.h"
 
-#define ARENA_CAPACITY (64 * 1024 * 1024)
+#define ARENA_CAPACITY (256 * 1024 * 1024)
 #define IO_BUFFER_SIZE (8 * 1024)
 
 typedef GifArena Arena;
@@ -46,18 +46,19 @@ int main(void) {
         if (pixels_srgb == NULL) {
             goto fail;
         }
-        srgb_to_linear(pixels_srgb, pixel_count, pixels);
+        srgb_to_float(pixels_srgb, pixel_count, pixels);
 
         arena = arena_rewind;
     }
 
     // Pick a color palette and convert the input image, so that it only uses the selected colors.
 
-    isize color_count = srgb_palette_web_safe(NULL);
-    f32 *colors = arena_alloc(&arena, color_count * 3 * sizeof(f32));
+    isize max_color_count = 256;
+    f32 *colors = arena_alloc(&arena, max_color_count * 3 * sizeof(f32));
+    isize color_count = palette_by_median_cut(pixels, pixel_count, colors, max_color_count, arena);
+
     u8 *srgb_colors = arena_alloc(&arena, color_count * 3 * sizeof(u8));
-    srgb_palette_web_safe(srgb_colors);
-    srgb_to_linear(srgb_colors, color_count, colors);
+    float_to_srgb(colors, color_count, srgb_colors);
 
     GifColorIndex *indexed_pixels = arena_alloc(&arena, pixel_count * sizeof(GifColorIndex));
     image_quantize_for_gif(pixels, pixel_count, colors, color_count, indexed_pixels, arena);
