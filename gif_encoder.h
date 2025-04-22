@@ -154,6 +154,8 @@ void gif_encoder_start(
     GifOutputBuffer *out_buffer
 );
 
+void gif_frame_delay(GifEncoder *encoder, f32 seconds);
+
 void gif_encoder_start_frame(
     GifEncoder *encoder,
     u8 const *local_colors,

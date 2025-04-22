@@ -127,13 +127,14 @@ int main(void) {
     };
     image.pixels = gif_arena_alloc(&arena, image.width * image.height);
 
-    isize color_count = srgb_palette_monochrome(NULL);
+    isize color_count = srgb_palette_black_and_white(NULL);
     u8 *colors = gif_arena_alloc(&arena, color_count * 3);
-    srgb_palette_monochrome(colors);
+    srgb_palette_black_and_white(colors);
 
     FILE *output_file = fopen("autohex.gif", "wb");
 
     GifEncoder *encoder = gif_encoder_create(&arena);
+    gif_frame_delay(encoder, 0.1F);
 
     GifOutputBuffer out_buffer;
     gif_out_buffer_create(8192, &out_buffer, &arena);
@@ -166,7 +167,7 @@ int main(void) {
             for (isize grid_x = 0; grid_x < grid_width; grid_x += 1) {
                 bool fill = cells_ping[grid_y * grid_width + grid_x];
 
-                hexagon_draw(&image, (isizex2){x, y}, side, 255, fill);
+                hexagon_draw(&image, (isizex2){x, y}, side, 1, fill);
 
                 x += 2 * inner_radius;
             }
