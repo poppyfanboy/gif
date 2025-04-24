@@ -75,14 +75,6 @@ void float_to_srgb(f32 const *srgb_colors, isize color_count, u8 *still_srgb_col
 void srgb_to_linear(u8 const *srgb_colors, isize color_count, f32 *linear_colors);
 void linear_to_srgb(f32 const *linear_colors, isize color_count, u8 *srgb_colors);
 
-// 1. sRGB -> Linear sRGB
-//
-// 2. Linear sRGB -> XYZ:
-//    https://en.wikipedia.org/wiki/CIE_1931_color_space
-//    http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
-//
-// 3. XYZ -> LAB:
-//    https://en.wikipedia.org/wiki/CIELAB_color_space
 void srgb_to_lab(u8 const *srgb_colors, isize color_count, f32 *lab_colors);
 void lab_to_srgb(f32 const *lab_colors, isize color_count, u8 *srgb_colors);
 
