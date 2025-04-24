@@ -3,17 +3,21 @@
 // - https://en.wikipedia.org/wiki/GIF
 // - https://web.archive.org/web/20180620143135/https://www.vurdalakov.net/misc/gif/netscape-looping-application-extension
 
-// TODO: Finish copy-pasting functions from "main.c".
 // TODO: Try converting the input image into LAB or Oklab color spaces before quantization.
+// TODO: Try this https://orlp.net/blog/taming-float-sums out when averaging colors in median-cut?
+// TODO: Measure how much time (and memory) does each stage of converting an image to GIF take.
+// TODO: Split hashset into multiple smaller ones when searching for unique colors in median-cut?
+// TODO: Transdiff from ffmpeg: unchanged pixels are encoded as transparent on next frame.
+// TODO: Color search: partition space, create list of possible closest colors for each partition.
+// TODO: Color search: sort colors along 3 axis, first check colors which have closer projections.
 // TODO: Add a function for dithering? I have no idea how it's done though.
-// TODO: Implement something similar to transdiff from ffmpeg.
 
 #include "gif_encoder.h"
 
 #include <assert.h> // assert
 #include <stdlib.h> // abort, qsort
 #include <stddef.h> // size_t, NULL
-#include <math.h>   // copysignf, powf, roundf, isnan, nanf
+#include <math.h>   // copysignf, powf, roundf, isnan, nanf, INFINITY
 #include <string.h> // memmove, memset, memcmp
 
 #define UNIMPLEMENTED()                 \
@@ -42,6 +46,25 @@ void *gif_arena_alloc(GifArena *arena, isize size) {
     void *ptr = arena->begin + padding;
     arena->begin += padding + size;
     return ptr;
+}
+
+static void *gif_arena_realloc(GifArena *arena, void *old_ptr, isize old_size, isize new_size) {
+    assert(old_size > 0 && new_size > 0);
+    assert(old_ptr != NULL);
+    assert(((uptr)old_ptr & (ARENA_ALIGNMENT - 1)) == 0);
+
+    if (old_size >= new_size) {
+        return old_ptr;
+    }
+
+    if ((u8 *)old_ptr + old_size == arena->begin) {
+        arena->begin = old_ptr;
+        return gif_arena_alloc(arena, new_size);
+    } else {
+        void *new_ptr = gif_arena_alloc(arena, new_size);
+        memcpy(new_ptr, old_ptr, (size_t)old_size);
+        return new_ptr;
+    }
 }
 
 #define COMPONENTS_PER_COLOR 3
@@ -157,18 +180,129 @@ void linear_to_srgb(f32 const *linear_colors, isize color_count, u8 *srgb_colors
     }
 }
 
+typedef struct {
+    f32 x;
+    f32 y;
+    f32 z;
+} f32x3;
+
+static inline f32 f_xyz_to_lab(f32 t) {
+    // delta = 6 / 29
+    // t > delta^3
+    if (t > 216.0F / 24389.0F) {
+        return cbrtf(t);
+    } else {
+        // t * delta^(-2) / 3 + 4 / 29
+        return (24389.0F * t / 27.0F + 16.0F) / 116.0F;
+    }
+}
+
+static inline f32 f32_clamp(f32 value, f32 min, f32 max) {
+    if (value < min) {
+        return min;
+    }
+
+    if (value > max) {
+        return max;
+    }
+
+    return value;
+}
+
 void srgb_to_lab(u8 const *srgb_colors, isize color_count, f32 *lab_colors) {
-    UNUSED(srgb_colors);
-    UNUSED(color_count);
-    UNUSED(lab_colors);
-    UNIMPLEMENTED();
+    u8 const *srgb_color_iter = srgb_colors;
+    f32 *lab_color_iter = lab_colors;
+
+    while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
+        f32x3 linear_srgb = {
+            powf((f32)srgb_color_iter[0] / 255.0F, GAMMA),
+            powf((f32)srgb_color_iter[1] / 255.0F, GAMMA),
+            powf((f32)srgb_color_iter[2] / 255.0F, GAMMA),
+        };
+
+        // http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
+        f32x3 xyz = {
+            0.4124564F * linear_srgb.x + 0.3575761F * linear_srgb.y + 0.1804375F * linear_srgb.z,
+            0.2126729F * linear_srgb.x + 0.7151522F * linear_srgb.y + 0.0721750F * linear_srgb.z,
+            0.0193339F * linear_srgb.x + 0.1191920F * linear_srgb.y + 0.9503041F * linear_srgb.z,
+        };
+
+        // For Standard Illuminant D65:
+        f32 xn = 95.0489F;
+        f32 yn = 100.0F;
+        f32 zn = 108.8849F;
+
+        // https://en.wikipedia.org/wiki/CIELAB_color_space
+        //
+        // The lightness value, L*, defines black at 0 and white at 100.
+        //
+        // The a* axis is relative to the green–red opponent colors, with negative values toward
+        // green and positive values toward red. The b* axis represents the blue–yellow opponents,
+        // with negative numbers toward blue and positive toward yellow.
+        //
+        // The a* and b* axes are unbounded and depending on the reference white they can easily
+        // exceed ±150 to cover the human gamut. Nevertheless, software implementations often clamp
+        // these values for practical reasons. For instance, if integer math is being used it is
+        // common to clamp a* and b* in the range of −128 to 127.
+
+        // http://www.brucelindbloom.com/Eqn_XYZ_to_Lab.html
+
+        int L = 0, a = 1, b = 2;
+
+        lab_color_iter[L] = 116.0F * f_xyz_to_lab(xyz.y / yn) - 16.0F;
+
+        lab_color_iter[a] = 500.0F * (f_xyz_to_lab(xyz.x / xn) - f_xyz_to_lab(xyz.y / yn));
+        lab_color_iter[a] = f32_clamp(lab_color_iter[a], -128.0F, 127.0F);
+
+        lab_color_iter[b] = 200.0F * (f_xyz_to_lab(xyz.y / yn) - f_xyz_to_lab(xyz.z / zn));
+        lab_color_iter[b] = f32_clamp(lab_color_iter[b], -128.0F, 127.0F);
+
+        srgb_color_iter += COMPONENTS_PER_COLOR;
+        lab_color_iter += COMPONENTS_PER_COLOR;
+    }
+}
+
+// The inverse of f_xyz_to_lab.
+static inline f32 f_lab_to_xyz(f32 t) {
+    if (t * t * t > 216.0F / 24389.0F) {
+        return t * t * t;
+    } else {
+        return (116.0F * t - 16.0F) * 27.0F / 24389.0F;
+    }
 }
 
 void lab_to_srgb(f32 const *lab_colors, isize color_count, u8 *srgb_colors) {
-    UNUSED(lab_colors);
-    UNUSED(color_count);
-    UNUSED(srgb_colors);
-    UNIMPLEMENTED();
+    f32 const *lab_color_iter = lab_colors;
+    u8 *srgb_color_iter = srgb_colors;
+
+    while (lab_color_iter != lab_colors + color_count * COMPONENTS_PER_COLOR) {
+        // For Standard Illuminant D65:
+        f32 xn = 95.0489F;
+        f32 yn = 100.0F;
+        f32 zn = 108.8849F;
+
+        // http://www.brucelindbloom.com/index.html?Eqn_Lab_to_XYZ.html
+        int L = 0, a = 1, b = 2;
+        f32x3 xyz = {
+            f_lab_to_xyz(lab_color_iter[a] / 500.0F + (lab_color_iter[L] + 16.0F) / 116.0F) * xn,
+            f_lab_to_xyz((lab_color_iter[L] + 16.0F) / 116.0F) * yn,
+            f_lab_to_xyz((lab_color_iter[L] + 16.0F) / 116.0F - lab_color_iter[b] / 200.0F) * zn,
+        };
+
+        // http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
+        f32x3 linear_srgb = {
+            ( 3.2404542F) * xyz.x + (-1.5371385F) * xyz.y + (-0.4985314F) * xyz.z,
+            (-0.9692660F) * xyz.x + ( 1.8760108F) * xyz.y + ( 0.0415560F) * xyz.z,
+            ( 0.0556434F) * xyz.x + (-0.2040259F) * xyz.y + ( 1.0572252F) * xyz.z,
+        };
+
+        srgb_color_iter[0] = (u8)(powf(linear_srgb.x, 1.0F / GAMMA) * 255.0F);
+        srgb_color_iter[1] = (u8)(powf(linear_srgb.y, 1.0F / GAMMA) * 255.0F);
+        srgb_color_iter[2] = (u8)(powf(linear_srgb.z, 1.0F / GAMMA) * 255.0F);
+
+        lab_color_iter += COMPONENTS_PER_COLOR;
+        srgb_color_iter += COMPONENTS_PER_COLOR;
+    }
 }
 
 void srgb_to_oklab(u8 const *srgb_colors, isize color_count, f32 *oklab_colors) {
@@ -184,12 +318,6 @@ void oklab_to_srgb(f32 const *oklab_colors, isize color_count, u8 *srgb_colors) 
     UNUSED(srgb_colors);
     UNIMPLEMENTED();
 }
-
-typedef struct {
-    f32 x;
-    f32 y;
-    f32 z;
-} f32x3;
 
 // Based on djb2 hashing function:
 // http://www.cse.yorku.ca/~oz/hash.html
@@ -242,6 +370,10 @@ static void color_set_insert(ColorSet *colors, f32x3 new_color) {
 
 static inline isize isize_min(isize left, isize right) {
     return left < right ? left : right;
+}
+
+static inline isize isize_max(isize left, isize right) {
+    return left > right ? left : right;
 }
 
 static int f32x3_compare_x_only(void const *left_ptr, void const *right_ptr) {
@@ -349,8 +481,8 @@ isize palette_by_median_cut(
         queue.first_index = (queue.first_index + 1) % countof(queue.segments);
         queue.count -= 1;
 
-        f32 min_x = 1.0F, min_y = 1.0F, min_z = 1.0F;
-        f32 max_x = 0.0F, max_y = 0.0F, max_z = 0.0F;
+        f32 min_x = INFINITY, min_y = INFINITY, min_z = INFINITY;
+        f32 max_x = -INFINITY, max_y = -INFINITY, max_z = -INFINITY;
         {
             f32x3 *colors_iter = current_segment.begin;
             while (colors_iter != current_segment.end) {
@@ -382,11 +514,11 @@ isize palette_by_median_cut(
             comparator
         );
 
-        queue.segments[(queue.last_index + 1) % countof(queue.segments)] = (Segment) {
+        queue.segments[(queue.last_index + 1) % countof(queue.segments)] = (Segment){
             .begin = current_segment.begin,
             .end = current_segment.begin + (current_segment.end - current_segment.begin) / 2,
         };
-        queue.segments[(queue.last_index + 2) % countof(queue.segments)] = (Segment) {
+        queue.segments[(queue.last_index + 2) % countof(queue.segments)] = (Segment){
             .begin = current_segment.begin + (current_segment.end - current_segment.begin) / 2,
             .end = current_segment.end,
         };
@@ -398,9 +530,9 @@ isize palette_by_median_cut(
     isize segment_index = queue.first_index;
 
     while (true) {
-        f64 x_sum = 0;
-        f64 y_sum = 0;
-        f64 z_sum = 0;
+        f64 x_sum = 0.0;
+        f64 y_sum = 0.0;
+        f64 z_sum = 0.0;
 
         // TODO: Summing up floats like this might be a bad idea?
         f32x3 *segment_iter = queue.segments[segment_index].begin;
@@ -631,10 +763,24 @@ isize gif_out_buffer_capacity_left(GifOutputBuffer const *out_buffer) {
 }
 
 void gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, GifArena *arena) {
-    UNUSED(out_buffer);
-    UNUSED(min_capacity);
-    UNUSED(arena);
-    UNIMPLEMENTED();
+    isize new_capacity = isize_max(
+        min_capacity,
+        out_buffer->capacity + GIF_OUT_BUFFER_MIN_CAPACITY
+    );
+    assert(new_capacity > out_buffer->capacity);
+
+    u8 *new_buffer = gif_arena_realloc(
+        arena,
+        out_buffer->data,
+        out_buffer->capacity,
+        new_capacity
+    );
+    memset(new_buffer + out_buffer->capacity, 0, (size_t)(new_capacity - out_buffer->capacity));
+
+    out_buffer->data = new_buffer;
+    out_buffer->capacity = new_capacity;
+
+    assert(gif_out_buffer_capacity_left(out_buffer) >= GIF_OUT_BUFFER_MIN_CAPACITY);
 }
 
 void gif_out_buffer_reset(GifOutputBuffer *out_buffer) {
@@ -1306,7 +1452,7 @@ isize gif_encoder_feed_frame(
     }
 
     GifColorIndex const *pixel_iter = pixels;
-    GifColorIndex const *pixel_end = pixels + pixel_count;
+    GifColorIndex const *pixels_end = pixels + pixel_count;
 
     // This should only happen once, right after the frame has been started.
     //
@@ -1318,7 +1464,7 @@ isize gif_encoder_feed_frame(
         pixel_iter += 1;
     }
 
-    while (pixel_iter < pixel_end) {
+    while (pixel_iter < pixels_end) {
         // Make sure that we will be able to exit this function without a buffer overflow.
         //
         // Conservative check:
@@ -1365,7 +1511,7 @@ isize gif_encoder_feed_frame(
                 (ColorSequence){encoder->current_sequence.indices, encoder->current_sequence.count},
                 &next_lzw_code
             );
-        } while (pixel_iter < pixel_end && !new_sequence_found);
+        } while (pixel_iter < pixels_end && !new_sequence_found);
 
         if (new_sequence_found) {
             gif_encoder_write_lzw_code(
@@ -1488,16 +1634,43 @@ void gif_encoder_finish_frame(GifEncoder *encoder, GifOutputBuffer *out_buffer) 
 bool gif_encode_whole_frame(
     GifEncoder *encoder,
     u8 const *local_colors,
-    isize color_count,
+    isize local_color_count,
     GifColorIndex *pixels,
     GifOutputBuffer *out_buffer
 ) {
-    UNUSED(encoder);
-    UNUSED(local_colors);
-    UNUSED(color_count);
-    UNUSED(pixels);
-    UNUSED(out_buffer);
-    UNIMPLEMENTED();
+    assert(encoder->state == GIF_ENCODER_READY_FOR_NEXT_FRAME);
+
+    GifOutputBuffer out_buffer_rewind = *out_buffer;
+
+    GifColorIndex *pixel_iter = pixels;
+    GifColorIndex *pixels_end = pixels + encoder->width * encoder->height;
+
+    if (gif_out_buffer_capacity_left(out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
+        *out_buffer = out_buffer_rewind;
+        return false;
+    }
+    gif_encoder_start_frame(encoder, local_colors, local_color_count, out_buffer);
+
+    while (pixel_iter != pixels_end) {
+        if (gif_out_buffer_capacity_left(out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
+            *out_buffer = out_buffer_rewind;
+            return false;
+        }
+        pixel_iter += gif_encoder_feed_frame(
+            encoder,
+            pixel_iter,
+            pixels_end - pixel_iter,
+            out_buffer
+        );
+    }
+
+    if (gif_out_buffer_capacity_left(out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
+        *out_buffer = out_buffer_rewind;
+        return false;
+    }
+    gif_encoder_finish_frame(encoder, out_buffer);
+
+    return true;
 }
 
 void gif_encoder_finish(GifEncoder *encoder, GifOutputBuffer *out_buffer) {
