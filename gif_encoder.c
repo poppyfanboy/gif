@@ -17,7 +17,7 @@
 #include <assert.h> // assert
 #include <stdlib.h> // abort, qsort
 #include <stddef.h> // size_t, NULL
-#include <math.h>   // copysignf, powf, roundf, isnan, nanf, INFINITY
+#include <math.h>   // copysignf, powf, roundf, isnan, nanf, cbrtf, INFINITY
 #include <string.h> // memmove, memset, memcmp
 
 #define UNIMPLEMENTED()                 \
@@ -150,20 +150,28 @@ void float_to_srgb(f32 const *srgb_colors, isize color_count, u8 *srgb_colors_ou
     }
 }
 
-#define GAMMA 2.2F
+// https://en.wikipedia.org/wiki/SRGB#Transfer_function_("gamma")
+static inline f32 srgb_component_to_linear(f32 c) {
+    return c <= 0.04045F ? c / 12.92F : powf((c + 0.055F) / 1.055F, 2.4F);
+}
 
 void srgb_to_linear(u8 const *srgb_colors, isize color_count, f32 *linear_colors) {
     u8 const *srgb_color_iter = srgb_colors;
     f32 *linear_color_iter = linear_colors;
 
     while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
-        linear_color_iter[0] = powf((f32)srgb_color_iter[0] / 255.0F, GAMMA);
-        linear_color_iter[1] = powf((f32)srgb_color_iter[1] / 255.0F, GAMMA);
-        linear_color_iter[2] = powf((f32)srgb_color_iter[2] / 255.0F, GAMMA);
+        linear_color_iter[0] = srgb_component_to_linear((f32)srgb_color_iter[0] / 255.0F);
+        linear_color_iter[1] = srgb_component_to_linear((f32)srgb_color_iter[1] / 255.0F);
+        linear_color_iter[2] = srgb_component_to_linear((f32)srgb_color_iter[2] / 255.0F);
 
         srgb_color_iter += COMPONENTS_PER_COLOR;
         linear_color_iter += COMPONENTS_PER_COLOR;
     }
+}
+
+// https://en.wikipedia.org/wiki/SRGB#Transfer_function_("gamma")
+static inline f32 linear_component_to_srgb(f32 c) {
+    return c <= 0.0031308F ? 12.92F * c : 1.055F * powf(c, 1.0F / 2.4F) - 0.055F;
 }
 
 void linear_to_srgb(f32 const *linear_colors, isize color_count, u8 *srgb_colors) {
@@ -171,9 +179,9 @@ void linear_to_srgb(f32 const *linear_colors, isize color_count, u8 *srgb_colors
     u8 *srgb_color_iter = srgb_colors;
 
     while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
-        srgb_color_iter[0] = (u8)(powf(linear_color_iter[0], 1.0F / GAMMA) * 255.0F);
-        srgb_color_iter[1] = (u8)(powf(linear_color_iter[1], 1.0F / GAMMA) * 255.0F);
-        srgb_color_iter[2] = (u8)(powf(linear_color_iter[2], 1.0F / GAMMA) * 255.0F);
+        srgb_color_iter[0] = (u8)(linear_component_to_srgb(linear_color_iter[0]) * 255.0F);
+        srgb_color_iter[1] = (u8)(linear_component_to_srgb(linear_color_iter[1]) * 255.0F);
+        srgb_color_iter[2] = (u8)(linear_component_to_srgb(linear_color_iter[2]) * 255.0F);
 
         srgb_color_iter += COMPONENTS_PER_COLOR;
         linear_color_iter += COMPONENTS_PER_COLOR;
@@ -186,40 +194,18 @@ typedef struct {
     f32 z;
 } f32x3;
 
-static inline f32 f_xyz_to_lab(f32 t) {
-    // delta = 6 / 29
-    // t > delta^3
-    if (t > 216.0F / 24389.0F) {
-        return cbrtf(t);
-    } else {
-        // t * delta^(-2) / 3 + 4 / 29
-        return (24389.0F * t / 27.0F + 16.0F) / 116.0F;
-    }
-}
-
-static inline f32 f32_clamp(f32 value, f32 min, f32 max) {
-    if (value < min) {
-        return min;
-    }
-
-    if (value > max) {
-        return max;
-    }
-
-    return value;
-}
-
 void srgb_to_lab(u8 const *srgb_colors, isize color_count, f32 *lab_colors) {
     u8 const *srgb_color_iter = srgb_colors;
     f32 *lab_color_iter = lab_colors;
 
     while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
         f32x3 linear_srgb = {
-            powf((f32)srgb_color_iter[0] / 255.0F, GAMMA),
-            powf((f32)srgb_color_iter[1] / 255.0F, GAMMA),
-            powf((f32)srgb_color_iter[2] / 255.0F, GAMMA),
+            srgb_component_to_linear((f32)srgb_color_iter[0] / 255.0F),
+            srgb_component_to_linear((f32)srgb_color_iter[1] / 255.0F),
+            srgb_component_to_linear((f32)srgb_color_iter[2] / 255.0F),
         };
 
+        // sRGB -> XYZ (D65)
         // http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
         f32x3 xyz = {
             0.4124564F * linear_srgb.x + 0.3575761F * linear_srgb.y + 0.1804375F * linear_srgb.z,
@@ -227,10 +213,12 @@ void srgb_to_lab(u8 const *srgb_colors, isize color_count, f32 *lab_colors) {
             0.0193339F * linear_srgb.x + 0.1191920F * linear_srgb.y + 0.9503041F * linear_srgb.z,
         };
 
-        // For Standard Illuminant D65:
-        f32 xn = 95.0489F;
-        f32 yn = 100.0F;
-        f32 zn = 108.8849F;
+        // Standard Illuminant D65
+        // Search for "D65" here:
+        // http://www.brucelindbloom.com/javascript/ColorConv.js
+        f32 Xr = 0.95047F;
+        f32 Yr = 1.0F;
+        f32 Zr = 1.08883F;
 
         // https://en.wikipedia.org/wiki/CIELAB_color_space
         //
@@ -247,27 +235,22 @@ void srgb_to_lab(u8 const *srgb_colors, isize color_count, f32 *lab_colors) {
 
         // http://www.brucelindbloom.com/Eqn_XYZ_to_Lab.html
 
-        int L = 0, a = 1, b = 2;
+        f32 xr = xyz.x / Xr;
+        f32 fx = xr > 216.0F / 24389.0F ? cbrtf(xr) : (24389.0F * xr / 27.0F + 16.0F) / 116.0F;
 
-        lab_color_iter[L] = 116.0F * f_xyz_to_lab(xyz.y / yn) - 16.0F;
+        f32 yr = xyz.y / Yr;
+        f32 fy = yr > 216.0F / 24389.0F ? cbrtf(yr) : (24389.0F * yr / 27.0F + 16.0F) / 116.0F;
 
-        lab_color_iter[a] = 500.0F * (f_xyz_to_lab(xyz.x / xn) - f_xyz_to_lab(xyz.y / yn));
-        lab_color_iter[a] = f32_clamp(lab_color_iter[a], -128.0F, 127.0F);
+        f32 zr = xyz.z / Zr;
+        f32 fz = zr > 216.0F / 24389.0F ? cbrtf(zr) : (24389.0F * zr / 27.0F + 16.0F) / 116.0F;
 
-        lab_color_iter[b] = 200.0F * (f_xyz_to_lab(xyz.y / yn) - f_xyz_to_lab(xyz.z / zn));
-        lab_color_iter[b] = f32_clamp(lab_color_iter[b], -128.0F, 127.0F);
+        int const L = 0, a = 1, b = 2;
+        lab_color_iter[L] = 116.0F * fy - 16.0F;
+        lab_color_iter[a] = 500.0F * (fx - fy);
+        lab_color_iter[b] = 200.0F * (fy - fz);
 
         srgb_color_iter += COMPONENTS_PER_COLOR;
         lab_color_iter += COMPONENTS_PER_COLOR;
-    }
-}
-
-// The inverse of f_xyz_to_lab.
-static inline f32 f_lab_to_xyz(f32 t) {
-    if (t * t * t > 216.0F / 24389.0F) {
-        return t * t * t;
-    } else {
-        return (116.0F * t - 16.0F) * 27.0F / 24389.0F;
     }
 }
 
@@ -276,19 +259,37 @@ void lab_to_srgb(f32 const *lab_colors, isize color_count, u8 *srgb_colors) {
     u8 *srgb_color_iter = srgb_colors;
 
     while (lab_color_iter != lab_colors + color_count * COMPONENTS_PER_COLOR) {
-        // For Standard Illuminant D65:
-        f32 xn = 95.0489F;
-        f32 yn = 100.0F;
-        f32 zn = 108.8849F;
+        // Standard Illuminant D65
+        // Search for "D65" here:
+        // http://www.brucelindbloom.com/javascript/ColorConv.js
+
+        f32 Xr = 0.95047F;
+        f32 Yr = 1.0F;
+        f32 Zr = 1.08883F;
 
         // http://www.brucelindbloom.com/index.html?Eqn_Lab_to_XYZ.html
-        int L = 0, a = 1, b = 2;
-        f32x3 xyz = {
-            f_lab_to_xyz(lab_color_iter[a] / 500.0F + (lab_color_iter[L] + 16.0F) / 116.0F) * xn,
-            f_lab_to_xyz((lab_color_iter[L] + 16.0F) / 116.0F) * yn,
-            f_lab_to_xyz((lab_color_iter[L] + 16.0F) / 116.0F - lab_color_iter[b] / 200.0F) * zn,
-        };
 
+        int const L = 0, a = 1, b = 2;
+
+        f32 fy = (lab_color_iter[L] + 16.0F) / 116.0F;
+        f32 fx = lab_color_iter[a] / 500.0F + fy;
+        f32 fz = fy - lab_color_iter[b] / 200.0F;
+
+        f32 xr = fx * fx * fx > 216.0F / 24389.0F
+            ? fx * fx * fx
+            : (116.0F * fx - 16.0F) * 27.0F / 24389.0F;
+
+        f32 yr = lab_color_iter[L] > 216.0F / 27.0F
+            ? fy * fy * fy
+            : lab_color_iter[L] * 27.0F / 24389.0F;
+
+        f32 zr = fz * fz * fz > 216.0F / 24389.0F
+            ? fz * fz * fz
+            : (116.0F * fz - 16.0F) * 27.0F / 24389.0F;
+
+        f32x3 xyz = {xr * Xr, yr * Yr, zr * Zr};
+
+        // XYZ -> sRGB (D65)
         // http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
         f32x3 linear_srgb = {
             ( 3.2404542F) * xyz.x + (-1.5371385F) * xyz.y + (-0.4985314F) * xyz.z,
@@ -296,9 +297,9 @@ void lab_to_srgb(f32 const *lab_colors, isize color_count, u8 *srgb_colors) {
             ( 0.0556434F) * xyz.x + (-0.2040259F) * xyz.y + ( 1.0572252F) * xyz.z,
         };
 
-        srgb_color_iter[0] = (u8)(powf(linear_srgb.x, 1.0F / GAMMA) * 255.0F);
-        srgb_color_iter[1] = (u8)(powf(linear_srgb.y, 1.0F / GAMMA) * 255.0F);
-        srgb_color_iter[2] = (u8)(powf(linear_srgb.z, 1.0F / GAMMA) * 255.0F);
+        srgb_color_iter[0] = (u8)(linear_component_to_srgb(linear_srgb.x) * 255.0F);
+        srgb_color_iter[1] = (u8)(linear_component_to_srgb(linear_srgb.y) * 255.0F);
+        srgb_color_iter[2] = (u8)(linear_component_to_srgb(linear_srgb.z) * 255.0F);
 
         lab_color_iter += COMPONENTS_PER_COLOR;
         srgb_color_iter += COMPONENTS_PER_COLOR;
