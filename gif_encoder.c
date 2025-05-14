@@ -10,7 +10,8 @@
 // TODO: Transdiff from ffmpeg: unchanged pixels are encoded as transparent on next frame.
 // TODO: Color search: partition space, create list of possible closest colors for each partition.
 // TODO: Color search: sort colors along 3 axis, first check colors which have closer projections.
-// TODO: Add a function for dithering? I have no idea how it's done though.
+// TODO: Try using K-means clustering instead of median-cut?
+// TODO: Implement dithering? I don't know how it's done (though, random one should be easy).
 
 #include "gif_encoder.h"
 
