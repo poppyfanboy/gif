@@ -46,7 +46,7 @@ int main(void) {
         if (pixels_srgb == NULL) {
             goto fail;
         }
-        srgb_to_float(pixels_srgb, pixel_count, pixels);
+        srgb_to_oklab(pixels_srgb, pixel_count, pixels);
 
         arena = arena_rewind;
     }
@@ -58,7 +58,7 @@ int main(void) {
     isize color_count = palette_by_median_cut(pixels, pixel_count, colors, max_color_count, arena);
 
     u8 *srgb_colors = arena_alloc(&arena, color_count * 3 * sizeof(u8));
-    float_to_srgb(colors, color_count, srgb_colors);
+    oklab_to_srgb(colors, color_count, srgb_colors);
 
     GifColorIndex *indexed_pixels = arena_alloc(&arena, pixel_count * sizeof(GifColorIndex));
     image_quantize_for_gif(pixels, pixel_count, colors, color_count, indexed_pixels, arena);
