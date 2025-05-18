@@ -78,7 +78,6 @@ void linear_to_srgb(f32 const *linear_colors, isize color_count, u8 *srgb_colors
 void srgb_to_lab(u8 const *srgb_colors, isize color_count, f32 *lab_colors);
 void lab_to_srgb(f32 const *lab_colors, isize color_count, u8 *srgb_colors);
 
-// https://en.wikipedia.org/wiki/Oklab_color_space
 void srgb_to_oklab(u8 const *srgb_colors, isize color_count, f32 *oklab_colors);
 void oklab_to_srgb(f32 const *oklab_colors, isize color_count, u8 *srgb_colors);
 

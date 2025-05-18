@@ -3,7 +3,6 @@
 // - https://en.wikipedia.org/wiki/GIF
 // - https://web.archive.org/web/20180620143135/https://www.vurdalakov.net/misc/gif/netscape-looping-application-extension
 
-// TODO: Try converting the input image into LAB or Oklab color spaces before quantization.
 // TODO: Try this https://orlp.net/blog/taming-float-sums out when averaging colors in median-cut?
 // TODO: Measure how much time (and memory) does each stage of converting an image to GIF take.
 // TODO: Split hashset into multiple smaller ones when searching for unique colors in median-cut?
@@ -20,14 +19,6 @@
 #include <stddef.h> // size_t, NULL
 #include <math.h>   // copysignf, powf, roundf, isnan, nanf, cbrtf, INFINITY
 #include <string.h> // memmove, memset, memcmp
-
-#define UNIMPLEMENTED()                 \
-    do {                                \
-        assert(0 && "Unimplemented");   \
-        abort();                        \
-    } while (0)
-
-#define UNUSED(variable) (void)(variable)
 
 #define sizeof(expr) (isize)sizeof(expr)
 #define lengthof(string) (sizeof(string) - 1)
@@ -201,25 +192,23 @@ void srgb_to_lab(u8 const *srgb_colors, isize color_count, f32 *lab_colors) {
 
     while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
         f32x3 linear_srgb = {
-            srgb_component_to_linear((f32)srgb_color_iter[0] / 255.0F),
-            srgb_component_to_linear((f32)srgb_color_iter[1] / 255.0F),
-            srgb_component_to_linear((f32)srgb_color_iter[2] / 255.0F),
+            srgb_component_to_linear((f32)srgb_color_iter[0] / 255.0F) * 100.0F,
+            srgb_component_to_linear((f32)srgb_color_iter[1] / 255.0F) * 100.0F,
+            srgb_component_to_linear((f32)srgb_color_iter[2] / 255.0F) * 100.0F,
         };
 
         // sRGB -> XYZ (D65)
-        // http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
+        // https://en.wikipedia.org/wiki/SRGB#Primaries
         f32x3 xyz = {
-            0.4124564F * linear_srgb.x + 0.3575761F * linear_srgb.y + 0.1804375F * linear_srgb.z,
-            0.2126729F * linear_srgb.x + 0.7151522F * linear_srgb.y + 0.0721750F * linear_srgb.z,
-            0.0193339F * linear_srgb.x + 0.1191920F * linear_srgb.y + 0.9503041F * linear_srgb.z,
+            0.4124F * linear_srgb.x + 0.3576F * linear_srgb.y + 0.1805F * linear_srgb.z,
+            0.2126F * linear_srgb.x + 0.7152F * linear_srgb.y + 0.0722F * linear_srgb.z,
+            0.0193F * linear_srgb.x + 0.1192F * linear_srgb.y + 0.9505F * linear_srgb.z,
         };
 
         // Standard Illuminant D65
-        // Search for "D65" here:
-        // http://www.brucelindbloom.com/javascript/ColorConv.js
-        f32 Xr = 0.95047F;
-        f32 Yr = 1.0F;
-        f32 Zr = 1.08883F;
+        f32 Xr = 95.0489F;
+        f32 Yr = 100.0F;
+        f32 Zr = 108.8840F;
 
         // https://en.wikipedia.org/wiki/CIELAB_color_space
         //
@@ -234,7 +223,7 @@ void srgb_to_lab(u8 const *srgb_colors, isize color_count, f32 *lab_colors) {
         // these values for practical reasons. For instance, if integer math is being used it is
         // common to clamp a* and b* in the range of −128 to 127.
 
-        // http://www.brucelindbloom.com/Eqn_XYZ_to_Lab.html
+        // https://en.wikipedia.org/wiki/CIELAB_color_space#From_CIE_XYZ_to_CIELAB
 
         f32 xr = xyz.x / Xr;
         f32 fx = xr > 216.0F / 24389.0F ? cbrtf(xr) : (24389.0F * xr / 27.0F + 16.0F) / 116.0F;
@@ -261,14 +250,11 @@ void lab_to_srgb(f32 const *lab_colors, isize color_count, u8 *srgb_colors) {
 
     while (lab_color_iter != lab_colors + color_count * COMPONENTS_PER_COLOR) {
         // Standard Illuminant D65
-        // Search for "D65" here:
-        // http://www.brucelindbloom.com/javascript/ColorConv.js
+        f32 Xr = 95.0489F;
+        f32 Yr = 100.0F;
+        f32 Zr = 108.8840F;
 
-        f32 Xr = 0.95047F;
-        f32 Yr = 1.0F;
-        f32 Zr = 1.08883F;
-
-        // http://www.brucelindbloom.com/index.html?Eqn_Lab_to_XYZ.html
+        // https://en.wikipedia.org/wiki/CIELAB_color_space#From_CIELAB_to_CIEXYZ
 
         int const L = 0, a = 1, b = 2;
 
@@ -291,34 +277,86 @@ void lab_to_srgb(f32 const *lab_colors, isize color_count, u8 *srgb_colors) {
         f32x3 xyz = {xr * Xr, yr * Yr, zr * Zr};
 
         // XYZ -> sRGB (D65)
-        // http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
+        // https://en.wikipedia.org/wiki/SRGB#Primaries
         f32x3 linear_srgb = {
-            ( 3.2404542F) * xyz.x + (-1.5371385F) * xyz.y + (-0.4985314F) * xyz.z,
-            (-0.9692660F) * xyz.x + ( 1.8760108F) * xyz.y + ( 0.0415560F) * xyz.z,
-            ( 0.0556434F) * xyz.x + (-0.2040259F) * xyz.y + ( 1.0572252F) * xyz.z,
+            (+3.2406255F) * xyz.x + (-1.5372080F) * xyz.y + (-0.4986286F) * xyz.z,
+            (-0.9689307F) * xyz.x + (+1.8757561F) * xyz.y + (+0.0415175F) * xyz.z,
+            (+0.0557101F) * xyz.x + (-0.2040211F) * xyz.y + (+1.0569959F) * xyz.z,
         };
 
-        srgb_color_iter[0] = (u8)(linear_component_to_srgb(linear_srgb.x) * 255.0F);
-        srgb_color_iter[1] = (u8)(linear_component_to_srgb(linear_srgb.y) * 255.0F);
-        srgb_color_iter[2] = (u8)(linear_component_to_srgb(linear_srgb.z) * 255.0F);
+        srgb_color_iter[0] = (u8)(linear_component_to_srgb(linear_srgb.x / 100.0F) * 255.0F);
+        srgb_color_iter[1] = (u8)(linear_component_to_srgb(linear_srgb.y / 100.0F) * 255.0F);
+        srgb_color_iter[2] = (u8)(linear_component_to_srgb(linear_srgb.z / 100.0F) * 255.0F);
 
         lab_color_iter += COMPONENTS_PER_COLOR;
         srgb_color_iter += COMPONENTS_PER_COLOR;
     }
 }
 
+// https://en.wikipedia.org/wiki/Oklab_color_space#Conversion_from_sRGB
+// https://bottosson.github.io/posts/oklab/#converting-from-linear-srgb-to-oklab
 void srgb_to_oklab(u8 const *srgb_colors, isize color_count, f32 *oklab_colors) {
-    UNUSED(srgb_colors);
-    UNUSED(color_count);
-    UNUSED(oklab_colors);
-    UNIMPLEMENTED();
+    u8 const *srgb_iter = srgb_colors;
+    f32 *oklab_iter = oklab_colors;
+
+    while (srgb_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
+        f32x3 linear = {
+            srgb_component_to_linear((f32)srgb_iter[0] / 255.0F),
+            srgb_component_to_linear((f32)srgb_iter[1] / 255.0F),
+            srgb_component_to_linear((f32)srgb_iter[2] / 255.0F),
+        };
+
+        // From Wikipedia:
+        // > The (l,m,s) space used here is not the same as the LMS color space, but rather an
+        // > arbitrary space that was found numerically to best fit the color appearance data.
+        f32x3 lms = {
+            0.4122214708f * linear.x + 0.5363325363f * linear.y + 0.0514459929f * linear.z,
+            0.2119034982f * linear.x + 0.6806995451f * linear.y + 0.1073969566f * linear.z,
+            0.0883024619f * linear.x + 0.2817188376f * linear.y + 0.6299787005f * linear.z,
+        };
+        lms = (f32x3){cbrtf(lms.x), cbrtf(lms.y), cbrtf(lms.z)};
+
+        int const L = 0, a = 1, b = 2;
+        oklab_iter[L] = 0.2104542553f * lms.x + 0.7936177850f * lms.y - 0.0040720468f * lms.z;
+        oklab_iter[a] = 1.9779984951f * lms.x - 2.4285922050f * lms.y + 0.4505937099f * lms.z;
+        oklab_iter[b] = 0.0259040371f * lms.x + 0.7827717662f * lms.y - 0.8086757660f * lms.z;
+
+        srgb_iter += COMPONENTS_PER_COLOR;
+        oklab_iter += COMPONENTS_PER_COLOR;
+    }
 }
 
+// See srgb_to_oklab for the references.
 void oklab_to_srgb(f32 const *oklab_colors, isize color_count, u8 *srgb_colors) {
-    UNUSED(oklab_colors);
-    UNUSED(color_count);
-    UNUSED(srgb_colors);
-    UNIMPLEMENTED();
+    f32 const *oklab_iter = oklab_colors;
+    u8 *srgb_iter = srgb_colors;
+
+    while (oklab_iter != oklab_colors + color_count * COMPONENTS_PER_COLOR) {
+        int const L = 0, a = 1, b = 2;
+        f32x3 lms = {
+            oklab_iter[L] + 0.3963377774f * oklab_iter[a] + 0.2158037573f * oklab_iter[b],
+            oklab_iter[L] - 0.1055613458f * oklab_iter[a] - 0.0638541728f * oklab_iter[b],
+            oklab_iter[L] - 0.0894841775f * oklab_iter[a] - 1.2914855480f * oklab_iter[b],
+        };
+        lms = (f32x3){
+            lms.x * lms.x * lms.x,
+            lms.y * lms.y * lms.y,
+            lms.z * lms.z * lms.z,
+        };
+
+        f32x3 linear = {
+            +4.0767416621f * lms.x - 3.3077115913f * lms.y + 0.2309699292f * lms.z,
+            -1.2684380046f * lms.x + 2.6097574011f * lms.y - 0.3413193965f * lms.z,
+            -0.0041960863f * lms.x - 0.7034186147f * lms.y + 1.7076147010f * lms.z,
+        };
+
+        srgb_iter[0] = (u8)(linear_component_to_srgb(linear.x) * 255.0F);
+        srgb_iter[1] = (u8)(linear_component_to_srgb(linear.y) * 255.0F);
+        srgb_iter[2] = (u8)(linear_component_to_srgb(linear.z) * 255.0F);
+
+        oklab_iter += COMPONENTS_PER_COLOR;
+        srgb_iter += COMPONENTS_PER_COLOR;
+    }
 }
 
 // Based on djb2 hashing function:
