@@ -4,21 +4,15 @@
 // https://nhigham.com/2020/07/07/what-is-stochastic-rounding
 // https://gitlab.com/radfordneal/xsum
 //
-// I'm probably doing something (or alotathing) wrong here:
-// For some reason the average produced using Kahan summation is very often the exact same produced
-// by the fsum ported from Python which looks extremely suspicious. And also average_pairwise
-// usually produces less accurate results than average_block_pairwise, even though the latter is
-// supposed to be a more performant but less accurate variation of the algorithm.
-//
-// But anyway, the conclusion is that for summing up f32s I just need to use f64 and it's going to
-// be more than good enough for averaging colors. Splitting the single sum accumulator into multiple
-// ones might improve things (compilers can't do this themselves without -fassociative-math or
-// -ffast-math or whatever), but not by a lot.
+// The conclusion is that for computing the sum of f32s I just need to use f64. This approach is
+// going to be more than good enough for averaging colors in the median-cut algorithm. Splitting a
+// single sum accumulator variable into multiple separate accumulators improves performance as the
+// compiler will now be able to properly vectorize the loop.
 
 #include <assert.h> // assert
 #include <stdlib.h> // abort, malloc, qsort
 #include <stddef.h> // size_t, NULL
-#include <stdio.h>  // printf
+#include <stdio.h>  // printf, FILE, fopen, fscanf, feof
 #include <string.h> // memcpy
 #include <math.h>   // fabsf, fabs, copysignf
 
@@ -150,59 +144,140 @@ void *arena_alloc(Arena *arena, isize size) {
 
 f32 average_exact(f32 const *numbers, isize number_count, Arena arena);
 
+typedef enum {
+    BENCHMARK_INPUT_DATA,
+    BENCHMARK_INPUT_RANDOM,
+} BenchmarkInputKind;
+
+typedef struct {
+    BenchmarkInputKind kind;
+    isize performance_trials;
+    union {
+        struct {
+            u64 seed;
+            isize number_count;
+            f32 numbers_from;
+            f32 numbers_to;
+            isize accuracy_trials;
+        } random;
+
+        struct {
+            f32 *numbers;
+            isize number_count;
+        } data;
+    } as;
+} BenchmarkInput;
+
 typedef f32 (*BenchmarkProcedure)(f32 const *numbers, isize number_count, Arena arena);
 
-void benchmark(BenchmarkProcedure procedure, u64 seed, Arena arena) {
-    isize number_count = 100000000;
-    f32 numbers_from = -1e9F * 0.5;
-    f32 numbers_to = 1e9F * 1.5;
-
-    PCG32 rng;
-    pcg32_init(&rng, seed);
-
-    isize accuracy_test_count = 10;
-    u64 *accuracy_test_seeds = arena_alloc(&arena, accuracy_test_count * sizeof(u64));
-    for (isize i = 0; i < accuracy_test_count; i += 1) {
-        accuracy_test_seeds[i] = pcg32_random(&rng);
-    }
-
+void benchmark(BenchmarkProcedure procedure, BenchmarkInput const *input, Arena arena) {
     // Accuracy tests
 
     f64 accumulated_absolute_error = 0.0;
-    for (isize accuracy_test = 0; accuracy_test < accuracy_test_count; accuracy_test += 1) {
-        Arena arena_reset = arena;
 
-        PCG32 rng_local;
-        pcg32_init(&rng_local, accuracy_test_seeds[accuracy_test]);
-
-        f32 *numbers = arena_alloc(&arena, number_count * sizeof(f32));
-        for (isize i = 0; i < number_count; i += 1) {
-            f32 random = (f32)(pcg32_random(&rng) >> 8) * 0x1.0p-24F;
-            numbers[i] = random * (numbers_to - numbers_from) + numbers_from;
-        }
-
-        // Assume that the RNG is uniform and calcluate the exact value based on that instead?
-        f32 exact_value = average_exact(numbers, number_count, arena);
-        f32 prediction = procedure(numbers, number_count, arena);
-        accumulated_absolute_error += fabs((f64)exact_value - (f64)prediction);
-
-        arena = arena_reset;
+    isize accuracy_trials;
+    switch (input->kind) {
+    case BENCHMARK_INPUT_DATA: {
+        accuracy_trials = 1;
+    } break;
+    case BENCHMARK_INPUT_RANDOM: {
+        accuracy_trials = input->as.random.accuracy_trials;
+    } break;
     }
 
-    f64 mean_absolute_error = accumulated_absolute_error / (f64)accuracy_test_count;
+    if (input->kind == BENCHMARK_INPUT_DATA) {
+        isize number_count = input->as.data.number_count;
+        f32 *numbers = input->as.data.numbers;
+
+        f32 expected = average_exact(numbers, number_count, arena);
+        f32 actual = procedure(numbers, number_count, arena);
+
+        printf("================\n");
+        printf("expected value: %.9g\n", expected);
+        printf("actual value: %.9g\n", actual);
+
+        accumulated_absolute_error += fabs((f64)expected - (f64)actual);
+    } else if (input->kind == BENCHMARK_INPUT_RANDOM) {
+        PCG32 rng;
+        pcg32_init(&rng, input->as.random.seed);
+
+        isize number_count = input->as.random.number_count;
+
+        u64 *accuracy_test_seeds = arena_alloc(&arena, accuracy_trials * sizeof(u64));
+        for (isize i = 0; i < accuracy_trials; i += 1) {
+            accuracy_test_seeds[i] = pcg32_random(&rng);
+        }
+
+        for (isize accuracy_test = 0; accuracy_test < accuracy_trials; accuracy_test += 1) {
+            Arena arena_reset = arena;
+
+            PCG32 rng_local;
+            pcg32_init(&rng_local, accuracy_test_seeds[accuracy_test]);
+
+            f32 numbers_from = input->as.random.numbers_from;
+            f32 numbers_to = input->as.random.numbers_to;
+
+            f32 *numbers = arena_alloc(&arena, number_count * sizeof(f32));
+            for (isize i = 0; i < number_count; i += 1) {
+                f32 random = (f32)(pcg32_random(&rng_local) >> 8) * 0x1.0p-24F;
+                numbers[i] = random * (numbers_to - numbers_from) + numbers_from;
+            }
+
+            // Assume that the RNG is uniform and calcluate the exact value
+            // as "(numbers_from + numbers_to) / 2"?
+            //
+            // Thinking about it once again, no, it's not even about potentially RNG not being perfectly
+            // uniform, it's about the fact that we have a specific discrete case at hand instead of
+            // some theoretical unreachable "number_count -> ∞" case.
+            //
+            // BTW is this how it's deduced? I'm not sure, it's not obvious for me for some reason.
+            //
+            // ∫0..1(from + (to - from) * x)dx =
+            // from * x + (to - from) * x^2 / 2 | 0..1 =
+            // from + (to - from) / 2 =
+            // (from + to) / 2
+
+            f32 exact_value = average_exact(numbers, number_count, arena);
+            f32 prediction = procedure(numbers, number_count, arena);
+            accumulated_absolute_error += fabs((f64)exact_value - (f64)prediction);
+
+            arena = arena_reset;
+        }
+    }
+
+    f64 mean_absolute_error = accumulated_absolute_error / (f64)accuracy_trials;
+    printf("================\n");
     printf("Mean absolute error: %.17g\n", mean_absolute_error);
 
     // Performance tests
     // I stole this from here (FormatJSONBenchmark.pas):
     // https://gitlab.com/freepascal.org/fpc/source/-/merge_requests/1018
 
-    f32 *numbers = arena_alloc(&arena, number_count * sizeof(f32));
-    for (isize i = 0; i < number_count; i += 1) {
-        f32 random = (f32)(pcg32_random(&rng) >> 8) * 0x1.0p-24F;
-            numbers[i] = random * (numbers_to - numbers_from) + numbers_from;
-    }
+    isize performance_trials = input->performance_trials;
 
-    isize amplify = 10;
+    isize number_count;
+    f32 *numbers;
+    switch (input->kind) {
+    case BENCHMARK_INPUT_DATA: {
+        number_count = input->as.data.number_count;
+        numbers = input->as.data.numbers;
+    } break;
+    case BENCHMARK_INPUT_RANDOM: {
+        PCG32 rng;
+        pcg32_init(&rng, input->as.random.seed);
+
+        number_count = input->as.random.number_count;
+        numbers = arena_alloc(&arena, number_count * sizeof(f32));
+
+        f32 numbers_from = input->as.random.numbers_from;
+        f32 numbers_to = input->as.random.numbers_to;
+
+        for (isize i = 0; i < number_count; i += 1) {
+            f32 random = (f32)(pcg32_random(&rng) >> 8) * 0x1.0p-24F;
+                numbers[i] = random * (numbers_to - numbers_from) + numbers_from;
+        }
+    } break;
+    }
 
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -211,7 +286,7 @@ void benchmark(BenchmarkProcedure procedure, u64 seed, Arena arena) {
     f64 time;
     do {
         repetitions += 1;
-        for (isize i = 0; i < amplify; i += 1) {
+        for (isize i = 0; i < performance_trials; i += 1) {
             f32 result = procedure(numbers, number_count, arena);
             DO_NOT_OPTIMIZE(result);
         }
@@ -223,7 +298,7 @@ void benchmark(BenchmarkProcedure procedure, u64 seed, Arena arena) {
         time = (f64)(now.tv_sec - start.tv_sec) + (f64)(now.tv_nsec - start.tv_nsec) * 1e-9;
     } while (time < 0.5);
 
-    time = time / (f64)repetitions / (f64)amplify;
+    time = time / (f64)repetitions / (f64)performance_trials;
 
     char const *units[] = {"secs", "millis", "micros", "nanos"};
     isize unit_index = 0;
@@ -232,13 +307,14 @@ void benchmark(BenchmarkProcedure procedure, u64 seed, Arena arena) {
         time *= 1e3;
     }
 
+    printf("================\n");
     printf("%.1f %s per call\n", time, units[unit_index]);
 }
 
-#define BENCHMARK(function, seed, arena)    \
+#define BENCHMARK(function, input, arena)   \
     do {                                    \
         printf("%s\n", #function);          \
-        benchmark(function, seed, arena);   \
+        benchmark(function, input, arena);  \
         printf("\n");                       \
     } while (0)
 
@@ -257,7 +333,9 @@ f32 average_naive(f32 const *numbers, isize number_count, Arena arena) {
         sum += numbers[i];
     }
 
-    return sum / (f32)number_count;
+    // Cast to f64 in case number_count is so large that it cannot be represented in f32 with
+    // reasonable precision?
+    return (f32)((f64)sum / (f64)number_count);
 }
 
 // This is way too slow and probably does not do much to combat the error.
@@ -270,7 +348,7 @@ f32 average_naive_sorted(f32 const *numbers, isize number_count, Arena arena) {
 }
 
 // I think this is it, just use f64 for computing the sum. Results are almost exact for reasonable
-// input values. This whole thing was just a waste of time, I already do this anyway.
+// input values. This whole thing was just a waste of time, I already use this approach anyway.
 f32 average_naive_in_f64(f32 const *numbers, isize number_count, Arena arena) {
     UNUSED(arena);
 
@@ -288,47 +366,89 @@ f32 average_multi_x4_in_f64(f32 const *numbers, isize number_count, Arena arena)
 
     f64 sum[4] = {0.0, 0.0, 0.0, 0.0};
 
-    isize i = 0;
-    for (i = 0; i < number_count; i += 4) {
-        sum[0] += (f64)numbers[i];
-        sum[1] += (f64)numbers[i + 1];
-        sum[2] += (f64)numbers[i + 2];
-        sum[3] += (f64)numbers[i + 3];
+    f32 const *number_iter = numbers;
+    f32 const *numbers_end = numbers + number_count;
+
+    while (numbers_end - number_iter >= 4) {
+        sum[0] += (f64)number_iter[0];
+        sum[1] += (f64)number_iter[1];
+        sum[2] += (f64)number_iter[2];
+        sum[3] += (f64)number_iter[3];
+
+        number_iter += 4;
     }
 
-    sum[0] += i < number_count ? (f64)numbers[i++] : 0.0;
-    sum[1] += i < number_count ? (f64)numbers[i++] : 0.0;
-    sum[2] += i < number_count ? (f64)numbers[i++] : 0.0;
+    if (number_iter < numbers_end) {
+        sum[0] += (f64)*number_iter;
+        number_iter += 1;
+    }
+    if (number_iter < numbers_end) {
+        sum[1] += (f64)*number_iter;
+        number_iter += 1;
+    }
+    if (number_iter < numbers_end) {
+        sum[2] += (f64)*number_iter;
+        number_iter += 1;
+    }
 
     return (f32)((sum[0] + sum[1] + sum[2] + sum[3]) / (f64)number_count);
 }
 
-// I just wanted to try out using SSE intrinsics for the first time.
-f32 average_sse2_in_f64(f32 const *numbers, isize number_count, Arena arena) {
+#ifdef AVX
+
+// Pretty much useless. Compilers already do a good job of vectorizing average_multi_x4_in_f64.
+f32 average_multi_x16_avx_in_f64(f32 const *numbers, isize number_count, Arena arena) {
     UNUSED(arena);
 
-    __m128d sum[2] = {_mm_setzero_pd(), _mm_setzero_pd()};
+    __m256d sum[4] = {
+        _mm256_setzero_pd(),
+        _mm256_setzero_pd(),
+        _mm256_setzero_pd(),
+        _mm256_setzero_pd(),
+    };
 
-    isize i;
-    for (i = 0; i < number_count; i += 4) {
-        sum[0] = _mm_add_pd(sum[0], _mm_set_pd((f64)numbers[i], (f64)numbers[i + 1]));
-        sum[1] = _mm_add_pd(sum[1], _mm_set_pd((f64)numbers[i + 2], (f64)numbers[i + 3]));
+    f32 const *number_iter = numbers;
+    f32 const *numbers_end = numbers + number_count;
+
+    while (numbers_end - number_iter >= 16) {
+        sum[0] = _mm256_add_pd(sum[0], _mm256_cvtps_pd(_mm_loadu_ps(number_iter +  0)));
+        sum[1] = _mm256_add_pd(sum[1], _mm256_cvtps_pd(_mm_loadu_ps(number_iter +  4)));
+        sum[2] = _mm256_add_pd(sum[2], _mm256_cvtps_pd(_mm_loadu_ps(number_iter +  8)));
+        sum[3] = _mm256_add_pd(sum[3], _mm256_cvtps_pd(_mm_loadu_ps(number_iter + 12)));
+
+        number_iter += 16;
     }
 
-    f64 tail[3];
-    tail[0] = i < number_count ? (f64)numbers[i++] : 0.0;
-    tail[1] = i < number_count ? (f64)numbers[i++] : 0.0;
-    tail[2] = i < number_count ? (f64)numbers[i++] : 0.0;
+    f64 tail[16];
+    for (isize i = 0; i < 16; i += 1) {
+        if (number_iter < numbers_end) {
+            tail[i] = (f64)*number_iter;
+            number_iter += 1;
+        } else {
+            tail[i] = 0.0;
+        }
+    }
+    sum[0] = _mm256_add_pd(sum[0], _mm256_loadu_pd(tail +  0));
+    sum[1] = _mm256_add_pd(sum[1], _mm256_loadu_pd(tail +  4));
+    sum[2] = _mm256_add_pd(sum[2], _mm256_loadu_pd(tail +  8));
+    sum[3] = _mm256_add_pd(sum[3], _mm256_loadu_pd(tail + 12));
 
-    sum[0] = _mm_add_pd(sum[0], _mm_set_pd(tail[0], tail[1]));
-    sum[1] = _mm_add_sd(sum[1], _mm_set_pd1(tail[2]));
+    sum[0] = _mm256_add_pd(sum[0], sum[1]);
+    sum[2] = _mm256_add_pd(sum[2], sum[3]);
+    sum[0] = _mm256_add_pd(sum[0], sum[2]);
 
-    sum[0] = _mm_add_pd(sum[0], sum[1]);
-    __m128d high = _mm_castps_pd(_mm_movehl_ps(_mm_castpd_ps(sum[0]), _mm_castpd_ps(sum[0])));
-    sum[0] = _mm_add_sd(sum[0], high);
+    // hadd([a, b, c, d]) -> [a + b, a + b, c + d, c + d]
+    sum[0] = _mm256_hadd_pd(sum[0], sum[0]);
+    // high = [c + d, c + d]
+    __m128d high = _mm256_extractf128_pd(sum[0], 1);
+    // low = [a + b, a + b]
+    __m128d low = _mm256_castpd256_pd128(sum[0]);
 
-    return (f32)(_mm_cvtsd_f64(sum[0]) / (f64)number_count);
+    __m128d result = _mm_add_sd(low, high);
+    return (f32)(_mm_cvtsd_f64(result) / (f64)number_count);
 }
+
+#endif // AVX
 
 f32 sum_pairwise(f32 const *numbers, isize number_count) {
     if (number_count == 0) {
@@ -338,14 +458,20 @@ f32 sum_pairwise(f32 const *numbers, isize number_count) {
         return numbers[0];
     }
 
-    isize split = number_count / 2;
+    // Split at some power of two.
+    //
+    // Splitting in half often gives even worse precision than sum_block_pairwise, so try to split
+    // at powers of two? This seems to give more precise results *sometimes*.
+    isize isize_max = (isize)(~(usize)0 >> 1);
+    isize split = (isize_max >> __builtin_clzll((usize)number_count - 1)) + 1;
+
     return sum_pairwise(numbers, split) + sum_pairwise(numbers + split, number_count - split);
 }
 
 f32 average_pairwise(f32 const *numbers, isize number_count, Arena arena) {
     UNUSED(arena);
 
-    return sum_pairwise(numbers, number_count) / (f32)number_count;
+    return (f32)(sum_pairwise(numbers, number_count) / (f64)number_count);
 }
 
 f32 sum_block_pairwise(f32 const *numbers, isize number_count) {
@@ -369,7 +495,7 @@ f32 sum_block_pairwise(f32 const *numbers, isize number_count) {
 f32 average_block_pairwise(f32 const *numbers, isize number_count, Arena arena) {
     UNUSED(arena);
 
-    return sum_block_pairwise(numbers, number_count) / (f32)number_count;
+    return (f32)(sum_block_pairwise(numbers, number_count) / (f64)number_count);
 }
 
 f32 average_kahan(f32 const *numbers, isize number_count, Arena arena) {
@@ -385,7 +511,7 @@ f32 average_kahan(f32 const *numbers, isize number_count, Arena arena) {
         sum = t;
     }
 
-    return sum / (f32)number_count;
+    return (f32)(sum / (f64)number_count);
 }
 
 isize isize_min(isize left, isize right) {
@@ -395,24 +521,107 @@ isize isize_min(isize left, isize right) {
 f32 average_block_kahan(f32 const *numbers, isize number_count, Arena arena) {
     UNUSED(arena);
 
-    isize block_size = 32;
+    isize const block_size = 32;
 
     f32 sum = 0.0F;
     f32 error = 0.0F;
 
-    for (isize i = 0; i < number_count; i += block_size) {
+    f32 const *number_iter = numbers;
+    f32 const *numbers_end = numbers + number_count;
+
+    while (numbers_end - number_iter >= block_size) {
         f32 block_sum = 0.0F;
-        for (isize j = i; j < isize_min(i + block_size, number_count); j += 1) {
-            block_sum += numbers[j];
+        for (isize i = 0; i < block_size; i += 1) {
+            block_sum += number_iter[i];
         }
+
         f32 y = block_sum - error;
         f32 t = sum + y;
         error = (t - sum) - y;
         sum = t;
+
+        number_iter += block_size;
     }
 
-    return sum / (f32)number_count;
+    f32 tail_sum = 0.0F;
+    while (number_iter < numbers_end) {
+        tail_sum += *number_iter;
+        number_iter += 1;
+    }
+    sum += tail_sum - error;
+
+    return (f32)(sum / (f64)number_count);
 }
+
+#ifdef AVX
+
+// This one computes mulitple Kahan sums simultaneously and combines them afterwards, so it's going
+// to be less precise than average_block_kahan.
+//
+// I don't know if there is some clever way to combine multiple Kahan sums, so I'm just using Kahan
+// once again to sum up the "sum" terms; as for the "error" terms: they just get discarded.
+f32 average_block_kahan_avx(f32 const *numbers, isize number_count, Arena arena) {
+    UNUSED(arena);
+
+    __m256 sum = _mm256_setzero_ps();
+    __m256 error = _mm256_setzero_ps();
+
+    f32 const *number_iter = numbers;
+    f32 const *numbers_end = numbers + number_count;
+
+    while (numbers_end - number_iter >= 32) {
+        __m256 block_sum[4];
+        block_sum[0] = _mm256_loadu_ps(number_iter +  0);
+        block_sum[1] = _mm256_loadu_ps(number_iter +  8);
+        block_sum[2] = _mm256_loadu_ps(number_iter + 16);
+        block_sum[3] = _mm256_loadu_ps(number_iter + 24);
+
+        block_sum[0] = _mm256_add_ps(block_sum[0], block_sum[1]);
+        block_sum[2] = _mm256_add_ps(block_sum[2], block_sum[3]);
+        block_sum[0] = _mm256_add_ps(block_sum[0], block_sum[2]);
+
+        __m256 y = _mm256_sub_ps(block_sum[0], error);
+        __m256 t = _mm256_add_ps(sum, y);
+        error = _mm256_sub_ps(_mm256_sub_ps(t, sum), y);
+        sum = t;
+
+        number_iter += 32;
+    }
+    while (numbers_end - number_iter >= 8) {
+        __m256 y = _mm256_sub_ps(_mm256_loadu_ps(number_iter), error);
+        __m256 t = _mm256_add_ps(sum, y);
+        error = _mm256_sub_ps(_mm256_sub_ps(t, sum), y);
+        sum = t;
+
+        number_iter += 8;
+    }
+
+    f32 sum_scalar[8];
+    _mm256_storeu_ps(sum_scalar, sum);
+
+    // Handle the tail
+    {
+        f32 error_scalar[8];
+        _mm256_storeu_ps(error_scalar, error);
+
+        for (isize i = 0; i < numbers_end - number_iter; i += 1) {
+            sum_scalar[i] += number_iter[i] - error_scalar[i];
+        }
+    }
+
+    f32 final_sum = 0.0F;
+    f32 final_error = 0.0F;
+    for (isize j = 0; j < 8; j += 1) {
+        f32 y = sum_scalar[j] - final_error;
+        f32 t = final_sum + y;
+        final_error = (t - final_sum) - y;
+        final_sum = t;
+    }
+
+    return (f32)(final_sum / (f64)number_count);
+}
+
+#endif // AVX
 
 // https://github.com/python/cpython/blob/de19694cfbcaa1c85c3a4b7184a24ff21b1c0919/Modules/mathmodule.c#L1321
 // https://en.wikipedia.org/wiki/2Sum
@@ -470,8 +679,8 @@ f32 average_python_fsum(f32 const *numbers, isize number_count, Arena arena) {
 
             *partial_write_iter = x;
             partial_write_iter += 1;
-            partials.count = partial_write_iter - partials.data;
         }
+        partials.count = partial_write_iter - partials.data;
 
         number_iter += 1;
     }
@@ -512,7 +721,7 @@ f32 average_python_fsum(f32 const *numbers, isize number_count, Arena arena) {
         }
     }
 
-    return sum / (f32)number_count;
+    return (f32)(sum / (f64)number_count);
 }
 
 f32 average_exact(f32 const *numbers, isize number_count, Arena arena) {
@@ -524,16 +733,81 @@ int main(void) {
     u8 *arena_memory = malloc((size_t)arena_capacity);
     Arena arena = {arena_memory, arena_memory + arena_capacity};
 
-    u64 seed = 123;
-    BENCHMARK(average_naive, seed, arena);
-    BENCHMARK(average_naive_in_f64, seed, arena);
-    BENCHMARK(average_kahan, seed, arena);
-    BENCHMARK(average_block_kahan, seed, arena);
-    BENCHMARK(average_multi_x4_in_f64, seed, arena);
-    BENCHMARK(average_sse2_in_f64, seed, arena);
-    BENCHMARK(average_pairwise, seed, arena);
-    BENCHMARK(average_block_pairwise, seed, arena);
-    BENCHMARK(average_python_fsum, seed, arena);
+#if 1
+    BenchmarkInput input = {
+        .kind = BENCHMARK_INPUT_RANDOM,
+        .performance_trials = 10000,
+        .as.random = {
+            .seed = 123,
+
+            // more numbers => larger sum => less precision difference between different methods
+            .number_count = 1000000,
+            .numbers_from = -1e6F * 0.5,
+            .numbers_to = 1e6F * 1.5,
+
+            .accuracy_trials = 200,
+        },
+    };
+#elif 1
+    BenchmarkInput input = {
+        .kind = BENCHMARK_INPUT_DATA,
+        .performance_trials = 1000000000,
+        .as.data = {
+            .numbers = (f32[]){1e25F, 3.0F, -1e25F},
+            .number_count = 3,
+        },
+    };
+#else
+    FILE *file = fopen("input.txt", "rb");
+    if (file == NULL) {
+        return 1;
+    }
+
+    isize number_count = 0;
+    isize capacity = 32;
+    f32 *numbers = arena_alloc(&arena, capacity * sizeof(f32));
+
+    while (feof(file) == 0) {
+        if (number_count == capacity) {
+            isize new_capacity = capacity * 2;
+            arena.begin += (new_capacity - capacity) * sizeof(f32);
+            if (arena.begin > arena.end) {
+                abort();
+            }
+            capacity = new_capacity;
+        }
+
+        fscanf(file, "%f\n", &numbers[number_count]);
+        number_count += 1;
+    }
+
+    BenchmarkInput input = {
+        .kind = BENCHMARK_INPUT_DATA,
+        .performance_trials = 1000000,
+        .as.data = {
+            .numbers = numbers,
+            .number_count = number_count,
+        },
+    };
+#endif
+
+    BENCHMARK(average_naive, &input, arena);
+    BENCHMARK(average_naive_in_f64, &input, arena);
+    BENCHMARK(average_multi_x4_in_f64, &input, arena);
+#ifdef AVX
+    BENCHMARK(average_multi_x16_avx_in_f64, &input, arena);
+#endif
+
+    BENCHMARK(average_kahan, &input, arena);
+    BENCHMARK(average_block_kahan, &input, arena);
+#ifdef AVX
+    BENCHMARK(average_block_kahan_avx, &input, arena);
+#endif
+
+    BENCHMARK(average_pairwise, &input, arena);
+    BENCHMARK(average_block_pairwise, &input, arena);
+
+    BENCHMARK(average_python_fsum, &input, arena);
 
     return 0;
 }
