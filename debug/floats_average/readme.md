@@ -156,4 +156,4 @@ Mean absolute error: 0
 56.2 micros per call
 ```
 
-So, when considering a real-world example, even the naive algorithm which uses single precision-floats might be enough to compute an average of a bunch of values.
+So, when considering a real-world example, even the naive algorithm which uses single-precision floats might be enough to compute an average of a bunch of values.
