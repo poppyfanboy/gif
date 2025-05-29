@@ -396,6 +396,16 @@ f32 average_multi_x4_in_f64(f32 const *numbers, isize number_count, Arena arena)
 
 #ifdef AVX
 
+static inline isize isize_clamp(isize value, isize min, isize max) {
+    if (value < min) {
+        return min;
+    }
+    if (value > max) {
+        return max;
+    }
+    return value;
+}
+
 // Pretty much useless. Compilers already do a good job of vectorizing average_multi_x4_in_f64.
 f32 average_multi_x16_avx_in_f64(f32 const *numbers, isize number_count, Arena arena) {
     UNUSED(arena);
@@ -419,19 +429,28 @@ f32 average_multi_x16_avx_in_f64(f32 const *numbers, isize number_count, Arena a
         number_iter += 16;
     }
 
-    f64 tail[16];
-    for (isize i = 0; i < 16; i += 1) {
-        if (number_iter < numbers_end) {
-            tail[i] = (f64)*number_iter;
-            number_iter += 1;
-        } else {
-            tail[i] = 0.0;
-        }
-    }
-    sum[0] = _mm256_add_pd(sum[0], _mm256_loadu_pd(tail +  0));
-    sum[1] = _mm256_add_pd(sum[1], _mm256_loadu_pd(tail +  4));
-    sum[2] = _mm256_add_pd(sum[2], _mm256_loadu_pd(tail +  8));
-    sum[3] = _mm256_add_pd(sum[3], _mm256_loadu_pd(tail + 12));
+    // Handle the tail using masked loads
+
+    i32 const mask_table[8] = {-1, -1, -1, -1, 0, 0, 0, 0};
+
+    i32 const *mask_ptr = &mask_table[4 - isize_clamp(numbers_end - number_iter, 0, 4)];
+    // _mm_loadu_si128 loads data in little endian order.
+    __m128 tail = _mm_maskload_ps(number_iter, _mm_loadu_si128((__m128i *)mask_ptr));
+    sum[0] = _mm256_add_pd(sum[0], _mm256_cvtps_pd(tail));
+
+    mask_ptr = &mask_table[4 - isize_clamp(numbers_end - number_iter - 4, 0, 4)];
+    tail = _mm_maskload_ps(number_iter + 4, _mm_loadu_si128((__m128i *)mask_ptr));
+    sum[1] = _mm256_add_pd(sum[1], _mm256_cvtps_pd(tail));
+
+    mask_ptr = &mask_table[4 - isize_clamp(numbers_end - number_iter - 8, 0, 4)];
+    tail = _mm_maskload_ps(number_iter + 8, _mm_loadu_si128((__m128i *)mask_ptr));
+    sum[2] = _mm256_add_pd(sum[2], _mm256_cvtps_pd(tail));
+
+    mask_ptr = &mask_table[4 - isize_clamp(numbers_end - number_iter - 12, 0, 4)];
+    tail = _mm_maskload_ps(number_iter + 12, _mm_loadu_si128((__m128i *)mask_ptr));
+    sum[3] = _mm256_add_pd(sum[3], _mm256_cvtps_pd(tail));
+
+    // Sum everyting up
 
     sum[0] = _mm256_add_pd(sum[0], sum[1]);
     sum[2] = _mm256_add_pd(sum[2], sum[3]);
@@ -587,27 +606,38 @@ f32 average_block_kahan_avx(f32 const *numbers, isize number_count, Arena arena)
 
         number_iter += 32;
     }
-    while (numbers_end - number_iter >= 8) {
-        __m256 y = _mm256_sub_ps(_mm256_loadu_ps(number_iter), error);
-        __m256 t = _mm256_add_ps(sum, y);
-        error = _mm256_sub_ps(_mm256_sub_ps(t, sum), y);
-        sum = t;
-
-        number_iter += 8;
-    }
-
-    f32 sum_scalar[8];
-    _mm256_storeu_ps(sum_scalar, sum);
 
     // Handle the tail
     {
-        f32 error_scalar[8];
-        _mm256_storeu_ps(error_scalar, error);
+        i32 const mask_table[16] = {-1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0};
+        __m256 tail[4];
 
-        for (isize i = 0; i < numbers_end - number_iter; i += 1) {
-            sum_scalar[i] += number_iter[i] - error_scalar[i];
-        }
+        i32 const *mask_ptr = &mask_table[8 - isize_clamp(numbers_end - number_iter, 0, 8)];
+        tail[0] = _mm256_maskload_ps(number_iter, _mm256_loadu_si256((__m256i *)mask_ptr));
+
+        mask_ptr = &mask_table[8 - isize_clamp(numbers_end - number_iter - 8, 0, 8)];
+        tail[1] = _mm256_maskload_ps(number_iter + 8, _mm256_loadu_si256((__m256i *)mask_ptr));
+
+        mask_ptr = &mask_table[8 - isize_clamp(numbers_end - number_iter - 16, 0, 8)];
+        tail[2] = _mm256_maskload_ps(number_iter + 16, _mm256_loadu_si256((__m256i *)mask_ptr));
+
+        mask_ptr = &mask_table[8 - isize_clamp(numbers_end - number_iter - 24, 0, 8)];
+        tail[3] = _mm256_maskload_ps(number_iter + 24, _mm256_loadu_si256((__m256i *)mask_ptr));
+
+        tail[0] = _mm256_add_ps(tail[0], tail[1]);
+        tail[2] = _mm256_add_ps(tail[2], tail[3]);
+        tail[0] = _mm256_add_ps(tail[0], tail[2]);
+
+        __m256 y = _mm256_sub_ps(tail[0], error);
+        __m256 t = _mm256_add_ps(sum, y);
+        error = _mm256_sub_ps(_mm256_sub_ps(t, sum), y);
+        sum = t;
     }
+
+    // Sum up all partial sums using Kahan as well
+
+    f32 sum_scalar[8];
+    _mm256_storeu_ps(sum_scalar, sum);
 
     f32 final_sum = 0.0F;
     f32 final_error = 0.0F;
