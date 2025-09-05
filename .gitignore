@@ -1,2 +1,8 @@
-*.out
-*.o
+# This ignores everything, including the folders.
+*
+# This un-ignores the folders.
+!*/
+
+# Only keep the source code files.
+!*.c
+!*.h

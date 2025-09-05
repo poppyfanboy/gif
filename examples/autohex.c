@@ -19,8 +19,7 @@
 #include <time.h>       // time
 #include <assert.h>     // assert
 
-#include "common.h"
-#include "gif_encoder.h"
+#include "../src/gif_encoder.h"
 
 // *Really* minimal PCG32 code / (c) 2014 M.E. O'Neill / pcg-random.org
 // Licensed under Apache License 2.0 (NO WARRANTY, etc. see website)
@@ -399,7 +398,7 @@ int main(void) {
             y += 3 * hexagon_side / 2;
         }
 
-        printf("Frame %ld/%ld rendered\n", step + 1, step_count);
+        printf("Frame %td/%td rendered\n", step + 1, step_count);
 
         // Encode the frame.
 
@@ -431,7 +430,7 @@ int main(void) {
             gif_out_buffer_reset(&out_buffer);
         }
 
-        printf("Frame %ld/%ld encoded\n", step + 1, step_count);
+        printf("Frame %td/%td encoded\n", step + 1, step_count);
 
         // Advance the cellular automata state.
 
