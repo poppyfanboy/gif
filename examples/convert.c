@@ -132,6 +132,8 @@ int main(int arg_count, char **args) {
     }
     Arena arena = {arena_memory, arena_memory + arena_capacity};
 
+    // Read the pixels from the file.
+
     f32 *pixels;
     int image_width, image_height;
     {
@@ -140,8 +142,15 @@ int main(int arg_count, char **args) {
             fprintf(stderr, "Failed to load the input image: '%s'\n", input_file_name);
             return 1;
         }
+
         pixels = from_srgb(srgb_pixels, image_width * image_height, color_space, &arena);
+        if (pixels == NULL) {
+            fprintf(stderr, "Ran out of memory.\n");
+            return 1;
+        }
     }
+
+    // Pick a color palette.
 
     f32 *colors;
     u8 *srgb_colors;
@@ -180,12 +189,24 @@ int main(int arg_count, char **args) {
 
         colors = from_srgb(srgb_colors, color_count, color_space, &arena);
     }
+    if (colors == NULL || srgb_colors == NULL) {
+        fprintf(stderr, "Ran out of memory.\n");
+        return 1;
+    }
+
+    // Quantize the image using the picked color palette.
 
     GifColorIndex *indexed_pixels = image_quantize_for_gif(
         pixels, image_width * image_height,
         colors, color_count,
         &arena
     );
+    if (indexed_pixels == NULL) {
+        fprintf(stderr, "Ran out of memory.\n");
+        return 1;
+    }
+
+    // Encode the GIF.
 
     FILE *output_file = fopen(output_file_name, "wb");
     if (output_file == NULL) {
@@ -194,37 +215,41 @@ int main(int arg_count, char **args) {
     }
 
     GifEncoder *encoder = gif_encoder_create(&arena);
-    GifOutputBuffer out_buffer = gif_out_buffer_create(64 * 1024, &arena);
+    GifOutputBuffer *out_buffer = gif_out_buffer_create(64 * 1024, &arena);
+    if (encoder == NULL || out_buffer == NULL) {
+        fprintf(stderr, "Ran out of memory.\n");
+        return 1;
+    }
 
-    gif_encoder_start(encoder, image_width, image_height, srgb_colors, color_count, &out_buffer);
+    gif_encoder_start(encoder, image_width, image_height, srgb_colors, color_count, out_buffer);
     {
         GifColorIndex *indexed_pixel_iter = indexed_pixels;
         GifColorIndex *indexed_pixel_end = indexed_pixels + image_width * image_height;
 
-        gif_encoder_start_frame(encoder, NULL, 0, &out_buffer);
+        gif_encoder_start_frame(encoder, NULL, 0, out_buffer);
 
         while (indexed_pixel_iter != indexed_pixel_end) {
             indexed_pixel_iter += gif_encoder_feed_frame(
                 encoder,
                 indexed_pixel_iter,
                 indexed_pixel_end - indexed_pixel_iter,
-                &out_buffer
+                out_buffer
             );
-            if (gif_out_buffer_capacity_left(&out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
-                fwrite(out_buffer.data, 1, (size_t)out_buffer.encoded_size, output_file);
-                gif_out_buffer_reset(&out_buffer);
+            if (gif_out_buffer_capacity_left(out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
+                fwrite(out_buffer->data, 1, (size_t)out_buffer->encoded_size, output_file);
+                gif_out_buffer_reset(out_buffer);
             }
         }
 
-        gif_encoder_finish_frame(encoder, &out_buffer);
-        if (gif_out_buffer_capacity_left(&out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
-            fwrite(out_buffer.data, 1, (size_t)out_buffer.encoded_size, output_file);
-            gif_out_buffer_reset(&out_buffer);
+        gif_encoder_finish_frame(encoder, out_buffer);
+        if (gif_out_buffer_capacity_left(out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
+            fwrite(out_buffer->data, 1, (size_t)out_buffer->encoded_size, output_file);
+            gif_out_buffer_reset(out_buffer);
         }
     }
-    gif_encoder_finish(encoder, &out_buffer);
+    gif_encoder_finish(encoder, out_buffer);
 
-    fwrite(out_buffer.data, 1, (size_t)out_buffer.encoded_size, output_file);
+    fwrite(out_buffer->data, 1, (size_t)out_buffer->encoded_size, output_file);
     fclose(output_file);
 
     return 0;

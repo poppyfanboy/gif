@@ -357,7 +357,7 @@ int main(void) {
     GifEncoder *encoder = gif_encoder_create(&arena);
     gif_frame_delay(encoder, 0.1F);
 
-    GifOutputBuffer out_buffer = gif_out_buffer_create(8192, &arena);
+    GifOutputBuffer *out_buffer = gif_out_buffer_create(8192, &arena);
 
     Grid *grid_ping = arena_alloc(&arena, sizeof(Grid));
     grid_ping->data = arena_alloc(&arena, grid_width * grid_height * sizeof(bool));
@@ -381,10 +381,10 @@ int main(void) {
     grid_pong->height = grid_height;
     grid_pong->stride = grid_width;
 
-    gif_encoder_start(encoder, image.width, image.height, colors, color_count, &out_buffer);
-    if (gif_out_buffer_capacity_left(&out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
-        fwrite(out_buffer.data, 1, (size_t)out_buffer.encoded_size, output_file);
-        gif_out_buffer_reset(&out_buffer);
+    gif_encoder_start(encoder, image.width, image.height, colors, color_count, out_buffer);
+    if (gif_out_buffer_capacity_left(out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
+        fwrite(out_buffer->data, 1, (size_t)out_buffer->encoded_size, output_file);
+        gif_out_buffer_reset(out_buffer);
     }
 
     for (isize step = 0; step < step_count; step += 1) {
@@ -421,10 +421,10 @@ int main(void) {
         GifColorIndex *image_iter = image.pixels;
         GifColorIndex *image_end = image.pixels + image.width * image.height;
 
-        gif_encoder_start_frame(encoder, NULL, 0, &out_buffer);
-        if (gif_out_buffer_capacity_left(&out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
-            fwrite(out_buffer.data, 1, (size_t)out_buffer.encoded_size, output_file);
-            gif_out_buffer_reset(&out_buffer);
+        gif_encoder_start_frame(encoder, NULL, 0, out_buffer);
+        if (gif_out_buffer_capacity_left(out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
+            fwrite(out_buffer->data, 1, (size_t)out_buffer->encoded_size, output_file);
+            gif_out_buffer_reset(out_buffer);
         }
 
         while (image_iter != image_end) {
@@ -432,18 +432,18 @@ int main(void) {
                 encoder,
                 image_iter,
                 image_end - image_iter,
-                &out_buffer
+                out_buffer
             );
-            if (gif_out_buffer_capacity_left(&out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
-                fwrite(out_buffer.data, 1, (size_t)out_buffer.encoded_size, output_file);
-                gif_out_buffer_reset(&out_buffer);
+            if (gif_out_buffer_capacity_left(out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
+                fwrite(out_buffer->data, 1, (size_t)out_buffer->encoded_size, output_file);
+                gif_out_buffer_reset(out_buffer);
             }
         }
 
-        gif_encoder_finish_frame(encoder, &out_buffer);
-        if (gif_out_buffer_capacity_left(&out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
-            fwrite(out_buffer.data, 1, (size_t)out_buffer.encoded_size, output_file);
-            gif_out_buffer_reset(&out_buffer);
+        gif_encoder_finish_frame(encoder, out_buffer);
+        if (gif_out_buffer_capacity_left(out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
+            fwrite(out_buffer->data, 1, (size_t)out_buffer->encoded_size, output_file);
+            gif_out_buffer_reset(out_buffer);
         }
 
         printf("Frame %td/%td encoded\n", step + 1, step_count);
@@ -487,10 +487,10 @@ int main(void) {
         grid_ping = grid_pong;
         grid_pong = swap;
     }
-    gif_encoder_finish(encoder, &out_buffer);
+    gif_encoder_finish(encoder, out_buffer);
 
     // Write any leftover buffered data into the file.
-    fwrite(out_buffer.data, 1, (size_t)out_buffer.encoded_size, output_file);
+    fwrite(out_buffer->data, 1, (size_t)out_buffer->encoded_size, output_file);
     fclose(output_file);
 
     return 0;

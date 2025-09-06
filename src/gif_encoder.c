@@ -3,7 +3,6 @@
 // - https://en.wikipedia.org/wiki/GIF
 // - https://web.archive.org/web/20180620143135/https://www.vurdalakov.net/misc/gif/netscape-looping-application-extension
 
-// TODO: Try this https://orlp.net/blog/taming-float-sums out when averaging colors in median-cut?
 // TODO: Measure how much time (and memory) does each stage of converting an image to GIF take.
 // TODO: Split hashset into multiple smaller ones when searching for unique colors in median-cut?
 // TODO: Transdiff from ffmpeg: unchanged pixels are encoded as transparent on next frame.
@@ -15,7 +14,7 @@
 #include "gif_encoder.h"
 
 #include <assert.h> // assert
-#include <stdlib.h> // abort, qsort
+#include <stdlib.h> // qsort
 #include <stddef.h> // size_t, NULL
 #include <math.h>   // copysignf, powf, roundf, isnan, nanf, cbrtf, INFINITY
 #include <string.h> // memmove, memset, memcmp
@@ -39,13 +38,19 @@ static inline void arena_rewind(Arena *arena, Arena snapshot) {
     *arena = snapshot;
 }
 
+static inline isize arena_memory_left(Arena *arena) {
+    return arena->end - arena->begin;
+}
+
 static void *arena_alloc(Arena *arena, isize size) {
-    assert(size > 0);
+    if (size == 0) {
+        return NULL;
+    }
 
     isize padding = (~(uptr)arena->begin + 1) & (ARENA_ALIGNMENT - 1);
     isize memory_left = arena->end - arena->begin - padding;
-    if (memory_left < 0 || memory_left < size) {
-        abort();
+    if (memory_left < size) {
+        return NULL;
     }
 
     void *ptr = arena->begin + padding;
@@ -54,10 +59,12 @@ static void *arena_alloc(Arena *arena, isize size) {
 }
 
 static void *arena_realloc(Arena *arena, void *old_ptr, isize old_size, isize new_size) {
-    assert(old_size > 0 && new_size > 0);
     assert(old_ptr != NULL);
     assert(((uptr)old_ptr & (ARENA_ALIGNMENT - 1)) == 0);
 
+    if (new_size == 0) {
+        return NULL;
+    }
     if (old_size >= new_size) {
         return old_ptr;
     }
@@ -67,6 +74,10 @@ static void *arena_realloc(Arena *arena, void *old_ptr, isize old_size, isize ne
         return arena_alloc(arena, new_size);
     } else {
         void *new_ptr = arena_alloc(arena, new_size);
+        if (new_ptr == NULL) {
+            return NULL;
+        }
+
         memcpy(new_ptr, old_ptr, (size_t)old_size);
         return new_ptr;
     }
@@ -76,6 +87,11 @@ static void *arena_realloc(Arena *arena, void *old_ptr, isize old_size, isize ne
 
 u8 *srgb_palette_black_and_white(isize *color_count, void *arena) {
     u8 *colors = arena_alloc(arena, 2 * COMPONENTS_PER_COLOR * sizeof(u8));
+    if (colors == NULL) {
+        *color_count = 0;
+        return NULL;
+    }
+
     u8 *color_iter = colors;
 
     color_iter[0] = 0x00;
@@ -94,6 +110,11 @@ u8 *srgb_palette_black_and_white(isize *color_count, void *arena) {
 
 u8 *srgb_palette_monochrome(isize *color_count, void *arena) {
     u8 *colors = arena_alloc(arena, 256 * COMPONENTS_PER_COLOR * sizeof(u8));
+    if (colors == NULL) {
+        *color_count = 0;
+        return NULL;
+    }
+
     u8 *color_iter = colors;
 
     for (int shade = 0x00; shade <= 0xff; shade += 1) {
@@ -111,6 +132,11 @@ u8 *srgb_palette_monochrome(isize *color_count, void *arena) {
 u8 *srgb_palette_web_safe(isize *color_count, void *arena) {
     // 216 colors, because 6 * 6 * 6 == 216.
     u8 *colors = arena_alloc(arena, 216 * COMPONENTS_PER_COLOR * sizeof(u8));
+    if (colors == NULL) {
+        *color_count = 0;
+        return NULL;
+    }
+
     u8 *color_iter = colors;
 
     for (int red = 0x00; red <= 0xff; red += 0x33) {
@@ -131,6 +157,10 @@ u8 *srgb_palette_web_safe(isize *color_count, void *arena) {
 
 f32 *srgb_to_float(u8 const *srgb_colors, isize color_count, void *arena) {
     f32 *float_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(f32));
+    if (float_colors == NULL) {
+        return NULL;
+    }
+
     f32 *float_color_iter = float_colors;
 
     u8 const *srgb_color_iter = srgb_colors;
@@ -149,6 +179,10 @@ f32 *srgb_to_float(u8 const *srgb_colors, isize color_count, void *arena) {
 
 u8 *float_to_srgb(f32 const *float_colors, isize color_count, void *arena) {
     u8 *srgb_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(u8));
+    if (srgb_colors == NULL) {
+        return NULL;
+    }
+
     u8 *srgb_color_iter = srgb_colors;
 
     f32 const *float_color_iter = float_colors;
@@ -172,6 +206,10 @@ static inline f32 srgb_component_to_linear(f32 c) {
 
 f32 *srgb_to_linear(u8 const *srgb_colors, isize color_count, void *arena) {
     f32 *linear_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(f32));
+    if (linear_colors == NULL) {
+        return NULL;
+    }
+
     f32 *linear_color_iter = linear_colors;
 
     u8 const *srgb_color_iter = srgb_colors;
@@ -195,6 +233,10 @@ static inline f32 linear_component_to_srgb(f32 c) {
 
 u8 *linear_to_srgb(f32 const *linear_colors, isize color_count, void *arena) {
     u8 *srgb_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(u8));
+    if (srgb_colors == NULL) {
+        return NULL;
+    }
+
     u8 *srgb_color_iter = srgb_colors;
 
     f32 const *linear_color_iter = linear_colors;
@@ -219,6 +261,10 @@ typedef struct {
 
 f32 *srgb_to_lab(u8 const *srgb_colors, isize color_count, void *arena) {
     f32 *lab_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(f32));
+    if (lab_colors == NULL) {
+        return NULL;
+    }
+
     f32 *lab_color_iter = lab_colors;
 
     u8 const *srgb_color_iter = srgb_colors;
@@ -281,6 +327,10 @@ f32 *srgb_to_lab(u8 const *srgb_colors, isize color_count, void *arena) {
 
 u8 *lab_to_srgb(f32 const *lab_colors, isize color_count, void *arena) {
     u8 *srgb_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(u8));
+    if (srgb_colors == NULL) {
+        return NULL;
+    }
+
     u8 *srgb_color_iter = srgb_colors;
 
     f32 const *lab_color_iter = lab_colors;
@@ -336,6 +386,10 @@ u8 *lab_to_srgb(f32 const *lab_colors, isize color_count, void *arena) {
 // https://bottosson.github.io/posts/oklab/#converting-from-linear-srgb-to-oklab
 f32 *srgb_to_oklab(u8 const *srgb_colors, isize color_count, void *arena) {
     f32 *oklab_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(f32));
+    if (oklab_colors == NULL) {
+        return NULL;
+    }
+
     f32 *oklab_iter = oklab_colors;
 
     u8 const *srgb_iter = srgb_colors;
@@ -372,6 +426,10 @@ f32 *srgb_to_oklab(u8 const *srgb_colors, isize color_count, void *arena) {
 // See srgb_to_oklab for the references.
 u8 *oklab_to_srgb(f32 const *oklab_colors, isize color_count, void *arena) {
     u8 *srgb_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(u8));
+    if (srgb_colors == NULL) {
+        return NULL;
+    }
+
     u8 *srgb_iter = srgb_colors;
 
     f32 const *oklab_iter = oklab_colors;
@@ -493,19 +551,28 @@ f32 *palette_by_median_cut(
     assert(target_color_count <= GIF_MAX_COLORS);
 
     f32 *palette = arena_alloc(arena, target_color_count * COMPONENTS_PER_COLOR * sizeof(f32));
+    if (palette == NULL) {
+        *color_count = 0;
+        return NULL;
+    }
 
     Arena snapshot = arena_snapshot(arena);
-
-    ColorSet color_set;
-    color_set.color_count = 0;
 
     // TODO: I don't like this hashset capacity estimate, the test image only uses around 2% of the
     // allocated buckets. And also keep in mind that you will have to iterate over the entire list
     // of buckets to extract the unique colors. Maybe rehashing here is not a bad idea after all?
 
+    ColorSet color_set;
+    color_set.color_count = 0;
+
     // Worst case scenario: all pixels in the input image are different.
     color_set.bucket_count = isize_min(pixel_count, 256 * 256 * 256) * 3 / 2;
     color_set.buckets = arena_alloc(arena, color_set.bucket_count * sizeof(ColorSetBucket));
+    if (color_set.buckets == NULL) {
+        *color_count = 0;
+        return NULL;
+    }
+
     // If the implementation does not support quiet NaNs, these functions return zero.
     assert(nanf("") != 0.0F);
     for (isize i = 0; i < color_set.bucket_count; i += 1) {
@@ -522,9 +589,14 @@ f32 *palette_by_median_cut(
     }
 
     f32x3 *colors = arena_alloc(arena, color_set.color_count * sizeof(f32x3));
-    f32x3 *colors_end = colors + color_set.color_count;
+    if (colors == NULL) {
+        *color_count = 0;
+        return NULL;
+    }
 
     f32x3 *color_iter = colors;
+    f32x3 *colors_end = colors + color_set.color_count;
+
     ColorSetBucket *bucket_iter = color_set.buckets;
     while (bucket_iter < color_set.buckets + color_set.bucket_count) {
         if (!color_set_bucket_empty(*bucket_iter)) {
@@ -624,7 +696,6 @@ f32 *palette_by_median_cut(
         f64 y_sum = 0.0;
         f64 z_sum = 0.0;
 
-        // TODO: Summing up floats like this might be a bad idea?
         f32x3 *segment_iter = queue.segments[segment_index].begin;
         while (segment_iter < queue.segments[segment_index].end) {
             x_sum += segment_iter->x;
@@ -800,10 +871,16 @@ GifColorIndex *image_quantize_for_gif(
     assert(color_count <= (isize)GIF_COLOR_INDEX_MAX + 1);
 
     GifColorIndex *indexed_pixels = arena_alloc(arena, pixel_count * sizeof(GifColorIndex));
+    if (indexed_pixels == NULL) {
+        return NULL;
+    }
 
     Arena snapshot = arena_snapshot(arena);
 
     IndexedColor *indexed_colors = arena_alloc(arena, color_count * sizeof(IndexedColor));
+    if (indexed_colors == NULL) {
+        return NULL;
+    }
     {
         f32 const *color_iter = colors;
         GifColorIndex index = 0;
@@ -814,6 +891,10 @@ GifColorIndex *image_quantize_for_gif(
             index += 1;
             color_iter += COMPONENTS_PER_COLOR;
         }
+    }
+
+    if (arena_memory_left(arena) < color_count * sizeof(ColorTreeNode)) {
+        return NULL;
     }
     ColorTreeNode *color_tree = color_tree_construct(indexed_colors, color_count, 0, arena);
 
@@ -839,20 +920,27 @@ GifColorIndex *image_quantize_for_gif(
     return indexed_pixels;
 }
 
-GifOutputBuffer gif_out_buffer_create(isize min_capacity, void *arena) {
+GifOutputBuffer *gif_out_buffer_create(isize min_capacity, void *arena) {
     isize capacity = min_capacity;
     if (capacity < GIF_OUT_BUFFER_MIN_CAPACITY) {
         capacity = GIF_OUT_BUFFER_MIN_CAPACITY;
     }
 
-    GifOutputBuffer out_buffer;
-    out_buffer.data = arena_alloc(arena, capacity);
-    out_buffer.encoded_size = 0;
-    out_buffer.byte_pos = 0;
-    out_buffer.bit_pos = 0;
-    out_buffer.capacity = capacity;
+    GifOutputBuffer *out_buffer = arena_alloc(arena, sizeof(GifOutputBuffer));
+    if (out_buffer == NULL) {
+        return NULL;
+    }
 
-    memset(out_buffer.data, 0, (size_t)capacity);
+    out_buffer->data = arena_alloc(arena, capacity);
+    if (out_buffer->data == NULL) {
+        return NULL;
+    }
+    memset(out_buffer->data, 0, (size_t)capacity);
+
+    out_buffer->encoded_size = 0;
+    out_buffer->byte_pos = 0;
+    out_buffer->bit_pos = 0;
+    out_buffer->capacity = capacity;
 
     return out_buffer;
 }
@@ -861,7 +949,7 @@ isize gif_out_buffer_capacity_left(GifOutputBuffer const *out_buffer) {
     return out_buffer->capacity - out_buffer->byte_pos - (out_buffer->bit_pos == 0 ? 0 : 1);
 }
 
-void gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, void *arena) {
+bool gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, void *arena) {
     isize new_capacity = isize_max(
         min_capacity,
         out_buffer->capacity + GIF_OUT_BUFFER_MIN_CAPACITY
@@ -874,12 +962,17 @@ void gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, void *
         out_buffer->capacity,
         new_capacity
     );
+    if (new_buffer == NULL) {
+        return false;
+    }
     memset(new_buffer + out_buffer->capacity, 0, (size_t)(new_capacity - out_buffer->capacity));
 
     out_buffer->data = new_buffer;
     out_buffer->capacity = new_capacity;
 
     assert(gif_out_buffer_capacity_left(out_buffer) >= GIF_OUT_BUFFER_MIN_CAPACITY);
+
+    return true;
 }
 
 void gif_out_buffer_reset(GifOutputBuffer *out_buffer) {
@@ -1095,13 +1188,19 @@ isize gif_encoder_required_memory(void) {
         .end = (u8 *)isize_max,
     };
 
-    GifEncoder *encoder = arena_alloc(&fake_arena, sizeof(GifEncoder));
-    gif_encoder_init(encoder, &fake_arena);
+    GifEncoder encoder = {0};
+    arena_alloc(&fake_arena, sizeof(GifEncoder));
+    gif_encoder_init(&encoder, &fake_arena);
 
     return (isize)fake_arena.begin;
 }
 
 GifEncoder *gif_encoder_create(void *arena) {
+    isize required_memory = gif_encoder_required_memory();
+    if (arena_memory_left(arena) < required_memory) {
+        return NULL;
+    }
+
     GifEncoder *encoder = arena_alloc(arena, sizeof(GifEncoder));
     gif_encoder_init(encoder, arena);
 

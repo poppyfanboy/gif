@@ -111,9 +111,9 @@ typedef struct {
 
 // These make sure that any encoder function that writes something into the buffer can be called
 // successfully at least once.
-GifOutputBuffer gif_out_buffer_create(isize min_capacity, void *arena);
+GifOutputBuffer *gif_out_buffer_create(isize min_capacity, void *arena);
 isize gif_out_buffer_capacity_left(GifOutputBuffer const *out_buffer);
-void gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, void *arena);
+bool gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, void *arena);
 
 // Reset the buffer to free memory for new encoded data.
 void gif_out_buffer_reset(GifOutputBuffer *out_buffer);
