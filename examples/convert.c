@@ -19,23 +19,28 @@
 
 #include "../src/gif_encoder.h"
 
+typedef struct {
+    u8 *begin;
+    u8 *end;
+} Arena;
+
 typedef enum { SRGB, LINEAR, LAB, OKLAB } ColorSpace;
 
-void from_srgb(u8 const *srgb_colors, isize color_count, f32 *colors, ColorSpace color_space) {
+f32 *from_srgb(u8 const *srgb_colors, isize color_count, ColorSpace color_space, Arena *arena) {
     switch (color_space) {
-    case SRGB:      srgb_to_float(srgb_colors, color_count, colors);    break;
-    case LINEAR:    srgb_to_linear(srgb_colors, color_count, colors);   break;
-    case LAB:       srgb_to_lab(srgb_colors, color_count, colors);      break;
-    case OKLAB:     srgb_to_oklab(srgb_colors, color_count, colors);    break;
+    case SRGB:      return srgb_to_float(srgb_colors, color_count, arena);
+    case LINEAR:    return srgb_to_linear(srgb_colors, color_count, arena);
+    case LAB:       return srgb_to_lab(srgb_colors, color_count, arena);
+    case OKLAB:     return srgb_to_oklab(srgb_colors, color_count, arena);
     }
 }
 
-void into_srgb(f32 const *colors, isize color_count, ColorSpace color_space, u8 *srgb_colors) {
+u8 *into_srgb(f32 const *colors, isize color_count, ColorSpace color_space, Arena *arena) {
     switch (color_space) {
-    case SRGB:      float_to_srgb(colors, color_count, srgb_colors);    break;
-    case LINEAR:    linear_to_srgb(colors, color_count, srgb_colors);   break;
-    case LAB:       lab_to_srgb(colors, color_count, srgb_colors);      break;
-    case OKLAB:     oklab_to_srgb(colors, color_count, srgb_colors);    break;
+    case SRGB:      return float_to_srgb(colors, color_count, arena);
+    case LINEAR:    return linear_to_srgb(colors, color_count, arena);
+    case LAB:       return lab_to_srgb(colors, color_count, arena);
+    case OKLAB:     return oklab_to_srgb(colors, color_count, arena);
     }
 }
 
@@ -125,7 +130,7 @@ int main(int arg_count, char **args) {
         fprintf(stderr, "Failed to allocate memory for the arena.\n");
         return 1;
     }
-    GifArena arena = {arena_memory, arena_memory + arena_capacity};
+    Arena arena = {arena_memory, arena_memory + arena_capacity};
 
     f32 *pixels;
     int image_width, image_height;
@@ -133,31 +138,32 @@ int main(int arg_count, char **args) {
         u8 *srgb_pixels = stbi_load(input_file_name, &image_width, &image_height, NULL, 3);
         if (srgb_pixels == NULL) {
             fprintf(stderr, "Failed to load the input image: '%s'\n", input_file_name);
+            return 1;
         }
-        pixels = gif_arena_alloc(&arena, image_width * image_height * 3 * sizeof(f32));
-        from_srgb(srgb_pixels, image_width * image_height, pixels, color_space);
+        pixels = from_srgb(srgb_pixels, image_width * image_height, color_space, &arena);
     }
 
-    f32 *colors = gif_arena_alloc(&arena, max_color_count * 3 * sizeof(f32));
-    u8 *srgb_colors = gif_arena_alloc(&arena, max_color_count * 3 * sizeof(u8));
+    f32 *colors;
+    u8 *srgb_colors;
     isize color_count;
     if (palette == WEB_SAFE || palette == MONOCHROME || palette == BLACK_WHITE) {
-        typedef isize(*PaletteGen)(u8 *);
+        typedef u8 *(*PaletteGen)(isize *, void *);
         PaletteGen palette_gen = ((PaletteGen[]){
             [WEB_SAFE]      = srgb_palette_web_safe,
             [MONOCHROME]    = srgb_palette_monochrome,
             [BLACK_WHITE]   = srgb_palette_black_and_white,
         })[palette];
 
-        color_count = palette_gen(srgb_colors);
-        from_srgb(srgb_colors, color_count, colors, color_space);
+        srgb_colors = palette_gen(&color_count, &arena);
+        colors = from_srgb(srgb_colors, color_count, color_space, &arena);
     } else if (palette == GENERATE) {
-        color_count = palette_by_median_cut(
+        colors = palette_by_median_cut(
             pixels, image_width * image_height,
-            colors, max_color_count,
-            arena
+            max_color_count,
+            &color_count,
+            &arena
         );
-        into_srgb(colors, color_count, color_space, srgb_colors);
+        srgb_colors = into_srgb(colors, color_count, color_space, &arena);
     } else if (palette == FROM_FILE) {
         int palette_width, palette_height;
         srgb_colors = stbi_load(palette_file_name, &palette_width, &palette_height, NULL, 3);
@@ -172,17 +178,13 @@ int main(int arg_count, char **args) {
             return 1;
         }
 
-        from_srgb(srgb_colors, color_count, colors, color_space);
+        colors = from_srgb(srgb_colors, color_count, color_space, &arena);
     }
 
-    GifColorIndex *indexed_pixels = gif_arena_alloc(
-        &arena, image_width * image_height * sizeof(GifColorIndex)
-    );
-    image_quantize_for_gif(
+    GifColorIndex *indexed_pixels = image_quantize_for_gif(
         pixels, image_width * image_height,
         colors, color_count,
-        indexed_pixels,
-        arena
+        &arena
     );
 
     FILE *output_file = fopen(output_file_name, "wb");
@@ -192,9 +194,7 @@ int main(int arg_count, char **args) {
     }
 
     GifEncoder *encoder = gif_encoder_create(&arena);
-
-    GifOutputBuffer out_buffer;
-    gif_out_buffer_create(64 * 1024, &out_buffer, &arena);
+    GifOutputBuffer out_buffer = gif_out_buffer_create(64 * 1024, &arena);
 
     gif_encoder_start(encoder, image_width, image_height, srgb_colors, color_count, &out_buffer);
     {

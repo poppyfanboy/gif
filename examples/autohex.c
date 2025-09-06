@@ -295,8 +295,26 @@ void grid_step_hex_automata(Grid *source_grid, Grid *dest_grid, bool wrap) {
 }
 
 #define ARENA_CAPACITY (128 * 1024 * 1024)
-typedef GifArena Arena;
-#define arena_alloc gif_arena_alloc
+
+typedef struct {
+    u8 *begin;
+    u8 *end;
+} Arena;
+
+void *arena_alloc(Arena *arena, isize size) {
+    assert(size > 0);
+
+    isize const ARENA_ALIGNMENT = 16;
+    isize padding = (~(uptr)arena->begin + 1) & (ARENA_ALIGNMENT - 1);
+    isize memory_left = arena->end - arena->begin - padding;
+    if (memory_left < 0 || memory_left < size) {
+        abort();
+    }
+
+    void *ptr = arena->begin + padding;
+    arena->begin += padding + size;
+    return ptr;
+}
 
 typedef enum {
     AUTOHEX_MODE_FEED_110,
@@ -328,9 +346,8 @@ int main(void) {
     };
     image.pixels = arena_alloc(&arena, image.width * image.height);
 
-    isize color_count = srgb_palette_black_and_white(NULL);
-    u8 *colors = arena_alloc(&arena, color_count * 3);
-    srgb_palette_black_and_white(colors);
+    isize color_count;
+    u8 *colors = srgb_palette_black_and_white(&color_count, &arena);
 
     FILE *output_file = fopen("autohex.gif", "wb");
     if (output_file == NULL) {
@@ -340,8 +357,7 @@ int main(void) {
     GifEncoder *encoder = gif_encoder_create(&arena);
     gif_frame_delay(encoder, 0.1F);
 
-    GifOutputBuffer out_buffer;
-    gif_out_buffer_create(8192, &out_buffer, &arena);
+    GifOutputBuffer out_buffer = gif_out_buffer_create(8192, &arena);
 
     Grid *grid_ping = arena_alloc(&arena, sizeof(Grid));
     grid_ping->data = arena_alloc(&arena, grid_width * grid_height * sizeof(bool));

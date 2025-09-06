@@ -47,48 +47,43 @@
 //
 //  - Encoder should not hold onto the pointer to the arena, it needs to preallocate whatever memory
 //    it will need for the internal bookkeeping in advance.
-
-typedef struct {
-    u8 *begin;
-    u8 *end;
-} GifArena;
-
-// Always returns a non-null value.
-// Aborts in case we run out of memory.
-// Allocating 0 bytes is not allowed.
-void *gif_arena_alloc(GifArena *arena, isize size);
+//
+// An arena itself is just a pair of pointers. I don't provide the typedef in this header, so that
+// you had an option to define it yourself in your code.
+//
+//  typedef struct {
+//      u8 *begin;
+//      u8 *end;
+//  } Arena;
 
 // Color arrays here are assumed to have 3 components per pixel: red, green, blue (in this order).
 
 // Some predefined fixed color palettes.
-// Pass NULL to figure out the number of colors in the palette.
-isize srgb_palette_black_and_white(u8 *colors);
-isize srgb_palette_monochrome(u8 *colors);
-isize srgb_palette_web_safe(u8 *colors);
+u8 *srgb_palette_black_and_white(isize *color_count, void *arena);
+u8 *srgb_palette_monochrome(isize *color_count, void *arena);
+u8 *srgb_palette_web_safe(isize *color_count, void *arena);
 
 // Use these to convert the input image or sRGB palettes. Conversions back into sRGB might be needed
 // to encode global/local color tables into the GIF.
 
-void srgb_to_float(u8 const *srgb_colors, isize color_count, f32 *still_srgb_colors);
-void float_to_srgb(f32 const *srgb_colors, isize color_count, u8 *still_srgb_colors);
+f32 *srgb_to_float(u8 const *srgb_colors, isize color_count, void *arena);
+u8 *float_to_srgb(f32 const *srgb_colors, isize color_count, void *arena);
 
-void srgb_to_linear(u8 const *srgb_colors, isize color_count, f32 *linear_colors);
-void linear_to_srgb(f32 const *linear_colors, isize color_count, u8 *srgb_colors);
+f32 *srgb_to_linear(u8 const *srgb_colors, isize color_count, void *arena);
+u8 *linear_to_srgb(f32 const *linear_colors, isize color_count, void *arena);
 
-void srgb_to_lab(u8 const *srgb_colors, isize color_count, f32 *lab_colors);
-void lab_to_srgb(f32 const *lab_colors, isize color_count, u8 *srgb_colors);
+f32 *srgb_to_lab(u8 const *srgb_colors, isize color_count, void *arena);
+u8 *lab_to_srgb(f32 const *lab_colors, isize color_count, void *arena);
 
-void srgb_to_oklab(u8 const *srgb_colors, isize color_count, f32 *oklab_colors);
-void oklab_to_srgb(f32 const *oklab_colors, isize color_count, u8 *srgb_colors);
+f32 *srgb_to_oklab(u8 const *srgb_colors, isize color_count, void *arena);
+u8 *oklab_to_srgb(f32 const *oklab_colors, isize color_count, void *arena);
 
 // Generate a custom color palette that best fits the given image.
-// Returns the actual number of colors generated (<= target_color_count).
-isize palette_by_median_cut(
-    f32 const *pixels,
-    isize pixel_count,
-    f32 *colors,
+f32 *palette_by_median_cut(
+    f32 const *pixels, isize pixel_count,
     isize target_color_count,
-    GifArena arena
+    isize *color_count,
+    void *arena
 );
 
 // Prepare an image to be fed into the GIF encoder.
@@ -96,13 +91,10 @@ isize palette_by_median_cut(
 #define GIF_COLOR_INDEX_MAX 255
 typedef u8 GifColorIndex;
 
-void image_quantize_for_gif(
-    f32 const *pixels,
-    isize pixel_count,
-    f32 const *colors,
-    isize color_count,
-    GifColorIndex *indexed_pixels,
-    GifArena scratch_arena
+GifColorIndex *image_quantize_for_gif(
+    f32 const *pixels, isize pixel_count,
+    f32 const *colors, isize color_count,
+    void *arena
 );
 
 // The absolute minimum amount of memory needed to encode the whole GIF, given that you flush and
@@ -119,9 +111,9 @@ typedef struct {
 
 // These make sure that any encoder function that writes something into the buffer can be called
 // successfully at least once.
-void gif_out_buffer_create(isize min_capacity, GifOutputBuffer *out_buffer, GifArena *arena);
+GifOutputBuffer gif_out_buffer_create(isize min_capacity, void *arena);
 isize gif_out_buffer_capacity_left(GifOutputBuffer const *out_buffer);
-void gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, GifArena *arena);
+void gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, void *arena);
 
 // Reset the buffer to free memory for new encoded data.
 void gif_out_buffer_reset(GifOutputBuffer *out_buffer);
@@ -129,7 +121,7 @@ void gif_out_buffer_reset(GifOutputBuffer *out_buffer);
 typedef struct GifEncoder GifEncoder;
 
 isize gif_encoder_required_memory(void);
-GifEncoder *gif_encoder_create(GifArena *arena);
+GifEncoder *gif_encoder_create(void *arena);
 
 // Almost every encoder function below causes a buffer overflow, if there is not enough space in the
 // buffer for it to successfully finish writing their portion of encoded data. You are supposed to

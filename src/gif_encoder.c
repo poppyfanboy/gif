@@ -26,7 +26,20 @@
 
 #define ARENA_ALIGNMENT 16
 
-void *gif_arena_alloc(GifArena *arena, isize size) {
+typedef struct {
+    u8 *begin;
+    u8 *end;
+} Arena;
+
+static inline Arena arena_snapshot(Arena *arena) {
+    return *arena;
+}
+
+static inline void arena_rewind(Arena *arena, Arena snapshot) {
+    *arena = snapshot;
+}
+
+static void *arena_alloc(Arena *arena, isize size) {
     assert(size > 0);
 
     isize padding = (~(uptr)arena->begin + 1) & (ARENA_ALIGNMENT - 1);
@@ -40,7 +53,7 @@ void *gif_arena_alloc(GifArena *arena, isize size) {
     return ptr;
 }
 
-static void *gif_arena_realloc(GifArena *arena, void *old_ptr, isize old_size, isize new_size) {
+static void *arena_realloc(Arena *arena, void *old_ptr, isize old_size, isize new_size) {
     assert(old_size > 0 && new_size > 0);
     assert(old_ptr != NULL);
     assert(((uptr)old_ptr & (ARENA_ALIGNMENT - 1)) == 0);
@@ -51,9 +64,9 @@ static void *gif_arena_realloc(GifArena *arena, void *old_ptr, isize old_size, i
 
     if ((u8 *)old_ptr + old_size == arena->begin) {
         arena->begin = old_ptr;
-        return gif_arena_alloc(arena, new_size);
+        return arena_alloc(arena, new_size);
     } else {
-        void *new_ptr = gif_arena_alloc(arena, new_size);
+        void *new_ptr = arena_alloc(arena, new_size);
         memcpy(new_ptr, old_ptr, (size_t)old_size);
         return new_ptr;
     }
@@ -61,85 +74,95 @@ static void *gif_arena_realloc(GifArena *arena, void *old_ptr, isize old_size, i
 
 #define COMPONENTS_PER_COLOR 3
 
-isize srgb_palette_black_and_white(u8 *colors) {
-    if (colors != NULL) {
-        u8 *color_iter = colors;
+u8 *srgb_palette_black_and_white(isize *color_count, void *arena) {
+    u8 *colors = arena_alloc(arena, 2 * COMPONENTS_PER_COLOR * sizeof(u8));
+    u8 *color_iter = colors;
 
-        color_iter[0] = 0x00;
-        color_iter[1] = 0x00;
-        color_iter[2] = 0x00;
-        color_iter += COMPONENTS_PER_COLOR;
+    color_iter[0] = 0x00;
+    color_iter[1] = 0x00;
+    color_iter[2] = 0x00;
+    color_iter += COMPONENTS_PER_COLOR;
 
-        color_iter[0] = 0xff;
-        color_iter[1] = 0xff;
-        color_iter[2] = 0xff;
+    color_iter[0] = 0xff;
+    color_iter[1] = 0xff;
+    color_iter[2] = 0xff;
+    color_iter += COMPONENTS_PER_COLOR;
+
+    *color_count = 2;
+    return colors;
+}
+
+u8 *srgb_palette_monochrome(isize *color_count, void *arena) {
+    u8 *colors = arena_alloc(arena, 256 * COMPONENTS_PER_COLOR * sizeof(u8));
+    u8 *color_iter = colors;
+
+    for (int shade = 0x00; shade <= 0xff; shade += 1) {
+        color_iter[0] = (u8)shade;
+        color_iter[1] = (u8)shade;
+        color_iter[2] = (u8)shade;
+
         color_iter += COMPONENTS_PER_COLOR;
     }
 
-    return 2;
+    *color_count = 256;
+    return colors;
 }
 
-isize srgb_palette_monochrome(u8 *colors) {
-    if (colors != NULL) {
-        u8 *color_iter = colors;
+u8 *srgb_palette_web_safe(isize *color_count, void *arena) {
+    // 216 colors, because 6 * 6 * 6 == 216.
+    u8 *colors = arena_alloc(arena, 216 * COMPONENTS_PER_COLOR * sizeof(u8));
+    u8 *color_iter = colors;
 
-        for (int shade = 0x00; shade <= 0xff; shade += 1) {
-            color_iter[0] = (u8)shade;
-            color_iter[1] = (u8)shade;
-            color_iter[2] = (u8)shade;
+    for (int red = 0x00; red <= 0xff; red += 0x33) {
+        for (int green = 0x00; green <= 0xff; green += 0x33) {
+            for (int blue = 0x00; blue <= 0xff; blue += 0x33) {
+                color_iter[0] = (u8)red;
+                color_iter[1] = (u8)green;
+                color_iter[2] = (u8)blue;
 
-            color_iter += COMPONENTS_PER_COLOR;
-        }
-    }
-
-    return 256;
-}
-
-isize srgb_palette_web_safe(u8 *colors) {
-    if (colors != NULL) {
-        u8 *color_iter = colors;
-        for (int red = 0x00; red <= 0xff; red += 0x33) {
-            for (int green = 0x00; green <= 0xff; green += 0x33) {
-                for (int blue = 0x00; blue <= 0xff; blue += 0x33) {
-                    color_iter[0] = (u8)red;
-                    color_iter[1] = (u8)green;
-                    color_iter[2] = (u8)blue;
-
-                    color_iter += COMPONENTS_PER_COLOR;
-                }
+                color_iter += COMPONENTS_PER_COLOR;
             }
         }
     }
 
-    return 6 * 6 * 6;
+    *color_count = 216;
+    return colors;
 }
 
-void srgb_to_float(u8 const *srgb_colors, isize color_count, f32 *srgb_colors_out) {
+f32 *srgb_to_float(u8 const *srgb_colors, isize color_count, void *arena) {
+    f32 *float_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(f32));
+    f32 *float_color_iter = float_colors;
+
     u8 const *srgb_color_iter = srgb_colors;
-    f32 *srgb_color_out_iter = srgb_colors_out;
 
     while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
-        srgb_color_out_iter[0] = (f32)srgb_color_iter[0] / 255.0F;
-        srgb_color_out_iter[1] = (f32)srgb_color_iter[1] / 255.0F;
-        srgb_color_out_iter[2] = (f32)srgb_color_iter[2] / 255.0F;
+        float_color_iter[0] = (f32)srgb_color_iter[0] / 255.0F;
+        float_color_iter[1] = (f32)srgb_color_iter[1] / 255.0F;
+        float_color_iter[2] = (f32)srgb_color_iter[2] / 255.0F;
 
         srgb_color_iter += COMPONENTS_PER_COLOR;
-        srgb_color_out_iter += COMPONENTS_PER_COLOR;
+        float_color_iter += COMPONENTS_PER_COLOR;
     }
+
+    return float_colors;
 }
 
-void float_to_srgb(f32 const *srgb_colors, isize color_count, u8 *srgb_colors_out) {
-    f32 const *srgb_color_iter = srgb_colors;
-    u8 *srgb_color_out_iter = srgb_colors_out;
+u8 *float_to_srgb(f32 const *float_colors, isize color_count, void *arena) {
+    u8 *srgb_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(u8));
+    u8 *srgb_color_iter = srgb_colors;
 
-    while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
-        srgb_color_out_iter[0] = (u8)(srgb_color_iter[0] * 255.0F);
-        srgb_color_out_iter[1] = (u8)(srgb_color_iter[1] * 255.0F);
-        srgb_color_out_iter[2] = (u8)(srgb_color_iter[2] * 255.0F);
+    f32 const *float_color_iter = float_colors;
 
+    while (float_color_iter != float_colors + color_count * COMPONENTS_PER_COLOR) {
+        srgb_color_iter[0] = (u8)(float_color_iter[0] * 255.0F);
+        srgb_color_iter[1] = (u8)(float_color_iter[1] * 255.0F);
+        srgb_color_iter[2] = (u8)(float_color_iter[2] * 255.0F);
+
+        float_color_iter += COMPONENTS_PER_COLOR;
         srgb_color_iter += COMPONENTS_PER_COLOR;
-        srgb_color_out_iter += COMPONENTS_PER_COLOR;
     }
+
+    return srgb_colors;
 }
 
 // https://en.wikipedia.org/wiki/SRGB#Transfer_function_("gamma")
@@ -147,9 +170,11 @@ static inline f32 srgb_component_to_linear(f32 c) {
     return c <= 0.04045F ? c / 12.92F : powf((c + 0.055F) / 1.055F, 2.4F);
 }
 
-void srgb_to_linear(u8 const *srgb_colors, isize color_count, f32 *linear_colors) {
-    u8 const *srgb_color_iter = srgb_colors;
+f32 *srgb_to_linear(u8 const *srgb_colors, isize color_count, void *arena) {
+    f32 *linear_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(f32));
     f32 *linear_color_iter = linear_colors;
+
+    u8 const *srgb_color_iter = srgb_colors;
 
     while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
         linear_color_iter[0] = srgb_component_to_linear((f32)srgb_color_iter[0] / 255.0F);
@@ -159,6 +184,8 @@ void srgb_to_linear(u8 const *srgb_colors, isize color_count, f32 *linear_colors
         srgb_color_iter += COMPONENTS_PER_COLOR;
         linear_color_iter += COMPONENTS_PER_COLOR;
     }
+
+    return linear_colors;
 }
 
 // https://en.wikipedia.org/wiki/SRGB#Transfer_function_("gamma")
@@ -166,9 +193,11 @@ static inline f32 linear_component_to_srgb(f32 c) {
     return c <= 0.0031308F ? 12.92F * c : 1.055F * powf(c, 1.0F / 2.4F) - 0.055F;
 }
 
-void linear_to_srgb(f32 const *linear_colors, isize color_count, u8 *srgb_colors) {
-    f32 const *linear_color_iter = linear_colors;
+u8 *linear_to_srgb(f32 const *linear_colors, isize color_count, void *arena) {
+    u8 *srgb_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(u8));
     u8 *srgb_color_iter = srgb_colors;
+
+    f32 const *linear_color_iter = linear_colors;
 
     while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
         srgb_color_iter[0] = (u8)(linear_component_to_srgb(linear_color_iter[0]) * 255.0F);
@@ -178,6 +207,8 @@ void linear_to_srgb(f32 const *linear_colors, isize color_count, u8 *srgb_colors
         srgb_color_iter += COMPONENTS_PER_COLOR;
         linear_color_iter += COMPONENTS_PER_COLOR;
     }
+
+    return srgb_colors;
 }
 
 typedef struct {
@@ -186,9 +217,11 @@ typedef struct {
     f32 z;
 } f32x3;
 
-void srgb_to_lab(u8 const *srgb_colors, isize color_count, f32 *lab_colors) {
-    u8 const *srgb_color_iter = srgb_colors;
+f32 *srgb_to_lab(u8 const *srgb_colors, isize color_count, void *arena) {
+    f32 *lab_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(f32));
     f32 *lab_color_iter = lab_colors;
+
+    u8 const *srgb_color_iter = srgb_colors;
 
     while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
         f32x3 linear_srgb = {
@@ -242,11 +275,15 @@ void srgb_to_lab(u8 const *srgb_colors, isize color_count, f32 *lab_colors) {
         srgb_color_iter += COMPONENTS_PER_COLOR;
         lab_color_iter += COMPONENTS_PER_COLOR;
     }
+
+    return lab_colors;
 }
 
-void lab_to_srgb(f32 const *lab_colors, isize color_count, u8 *srgb_colors) {
-    f32 const *lab_color_iter = lab_colors;
+u8 *lab_to_srgb(f32 const *lab_colors, isize color_count, void *arena) {
+    u8 *srgb_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(u8));
     u8 *srgb_color_iter = srgb_colors;
+
+    f32 const *lab_color_iter = lab_colors;
 
     while (lab_color_iter != lab_colors + color_count * COMPONENTS_PER_COLOR) {
         // Standard Illuminant D65
@@ -291,13 +328,17 @@ void lab_to_srgb(f32 const *lab_colors, isize color_count, u8 *srgb_colors) {
         lab_color_iter += COMPONENTS_PER_COLOR;
         srgb_color_iter += COMPONENTS_PER_COLOR;
     }
+
+    return srgb_colors;
 }
 
 // https://en.wikipedia.org/wiki/Oklab_color_space#Conversion_from_sRGB
 // https://bottosson.github.io/posts/oklab/#converting-from-linear-srgb-to-oklab
-void srgb_to_oklab(u8 const *srgb_colors, isize color_count, f32 *oklab_colors) {
-    u8 const *srgb_iter = srgb_colors;
+f32 *srgb_to_oklab(u8 const *srgb_colors, isize color_count, void *arena) {
+    f32 *oklab_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(f32));
     f32 *oklab_iter = oklab_colors;
+
+    u8 const *srgb_iter = srgb_colors;
 
     while (srgb_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
         f32x3 linear = {
@@ -324,12 +365,16 @@ void srgb_to_oklab(u8 const *srgb_colors, isize color_count, f32 *oklab_colors) 
         srgb_iter += COMPONENTS_PER_COLOR;
         oklab_iter += COMPONENTS_PER_COLOR;
     }
+
+    return oklab_colors;
 }
 
 // See srgb_to_oklab for the references.
-void oklab_to_srgb(f32 const *oklab_colors, isize color_count, u8 *srgb_colors) {
-    f32 const *oklab_iter = oklab_colors;
+u8 *oklab_to_srgb(f32 const *oklab_colors, isize color_count, void *arena) {
+    u8 *srgb_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(u8));
     u8 *srgb_iter = srgb_colors;
+
+    f32 const *oklab_iter = oklab_colors;
 
     while (oklab_iter != oklab_colors + color_count * COMPONENTS_PER_COLOR) {
         int const L = 0, a = 1, b = 2;
@@ -357,6 +402,8 @@ void oklab_to_srgb(f32 const *oklab_colors, isize color_count, u8 *srgb_colors) 
         oklab_iter += COMPONENTS_PER_COLOR;
         srgb_iter += COMPONENTS_PER_COLOR;
     }
+
+    return srgb_colors;
 }
 
 // Based on djb2 hashing function:
@@ -437,14 +484,17 @@ static int f32x3_compare_z_only(void const *left_ptr, void const *right_ptr) {
     return (int)copysignf(1.0F, left.z - right.z);
 }
 
-isize palette_by_median_cut(
-    f32 const *pixels,
-    isize pixel_count,
-    f32 *palette,
+f32 *palette_by_median_cut(
+    f32 const *pixels, isize pixel_count,
     isize target_color_count,
-    GifArena arena
+    isize *color_count,
+    void *arena
 ) {
     assert(target_color_count <= GIF_MAX_COLORS);
+
+    f32 *palette = arena_alloc(arena, target_color_count * COMPONENTS_PER_COLOR * sizeof(f32));
+
+    Arena snapshot = arena_snapshot(arena);
 
     ColorSet color_set;
     color_set.color_count = 0;
@@ -455,7 +505,7 @@ isize palette_by_median_cut(
 
     // Worst case scenario: all pixels in the input image are different.
     color_set.bucket_count = isize_min(pixel_count, 256 * 256 * 256) * 3 / 2;
-    color_set.buckets = gif_arena_alloc(&arena, color_set.bucket_count * sizeof(ColorSetBucket));
+    color_set.buckets = arena_alloc(arena, color_set.bucket_count * sizeof(ColorSetBucket));
     // If the implementation does not support quiet NaNs, these functions return zero.
     assert(nanf("") != 0.0F);
     for (isize i = 0; i < color_set.bucket_count; i += 1) {
@@ -471,7 +521,7 @@ isize palette_by_median_cut(
         pixel_iter += COMPONENTS_PER_COLOR;
     }
 
-    f32x3 *colors = gif_arena_alloc(&arena, color_set.color_count * sizeof(f32x3));
+    f32x3 *colors = arena_alloc(arena, color_set.color_count * sizeof(f32x3));
     f32x3 *colors_end = colors + color_set.color_count;
 
     f32x3 *color_iter = colors;
@@ -596,7 +646,9 @@ isize palette_by_median_cut(
         segment_index = (segment_index + 1) % countof(queue.segments);
     }
 
-    return queue.count;
+    arena_rewind(arena, snapshot);
+    *color_count = queue.count;
+    return palette;
 }
 
 typedef struct {
@@ -641,11 +693,11 @@ static ColorTreeNode *color_tree_construct(
     IndexedColor *colors,
     isize color_count,
     isize depth,
-    GifArena *arena
+    Arena *arena
 ) {
     assert(color_count != 0);
 
-    ColorTreeNode *node = gif_arena_alloc(arena, sizeof(ColorTreeNode));
+    ColorTreeNode *node = arena_alloc(arena, sizeof(ColorTreeNode));
 
     if (color_count > 1) {
         isize color_component_index = depth % 3;
@@ -740,17 +792,18 @@ static void color_tree_get_nearest(
     }
 }
 
-void image_quantize_for_gif(
-    f32 const *pixels,
-    isize pixel_count,
-    f32 const *colors,
-    isize color_count,
-    GifColorIndex *indexed_pixels,
-    GifArena arena
+GifColorIndex *image_quantize_for_gif(
+    f32 const *pixels, isize pixel_count,
+    f32 const *colors, isize color_count,
+    void *arena
 ) {
     assert(color_count <= (isize)GIF_COLOR_INDEX_MAX + 1);
 
-    IndexedColor *indexed_colors = gif_arena_alloc(&arena, color_count * sizeof(IndexedColor));
+    GifColorIndex *indexed_pixels = arena_alloc(arena, pixel_count * sizeof(GifColorIndex));
+
+    Arena snapshot = arena_snapshot(arena);
+
+    IndexedColor *indexed_colors = arena_alloc(arena, color_count * sizeof(IndexedColor));
     {
         f32 const *color_iter = colors;
         GifColorIndex index = 0;
@@ -762,7 +815,7 @@ void image_quantize_for_gif(
             color_iter += COMPONENTS_PER_COLOR;
         }
     }
-    ColorTreeNode *color_tree = color_tree_construct(indexed_colors, color_count, 0, &arena);
+    ColorTreeNode *color_tree = color_tree_construct(indexed_colors, color_count, 0, arena);
 
     f32 const *pixel_iter = pixels;
     GifColorIndex *indexed_pixel_iter = indexed_pixels;
@@ -781,35 +834,41 @@ void image_quantize_for_gif(
         pixel_iter += COMPONENTS_PER_COLOR;
         indexed_pixel_iter += 1;
     }
+
+    arena_rewind(arena, snapshot);
+    return indexed_pixels;
 }
 
-void gif_out_buffer_create(isize min_capacity, GifOutputBuffer *out_buffer, GifArena *arena) {
+GifOutputBuffer gif_out_buffer_create(isize min_capacity, void *arena) {
     isize capacity = min_capacity;
     if (capacity < GIF_OUT_BUFFER_MIN_CAPACITY) {
         capacity = GIF_OUT_BUFFER_MIN_CAPACITY;
     }
 
-    out_buffer->data = gif_arena_alloc(arena, capacity);
-    out_buffer->encoded_size = 0;
-    out_buffer->byte_pos = 0;
-    out_buffer->bit_pos = 0;
-    out_buffer->capacity = capacity;
+    GifOutputBuffer out_buffer;
+    out_buffer.data = arena_alloc(arena, capacity);
+    out_buffer.encoded_size = 0;
+    out_buffer.byte_pos = 0;
+    out_buffer.bit_pos = 0;
+    out_buffer.capacity = capacity;
 
-    memset(out_buffer->data, 0, (size_t)capacity);
+    memset(out_buffer.data, 0, (size_t)capacity);
+
+    return out_buffer;
 }
 
 isize gif_out_buffer_capacity_left(GifOutputBuffer const *out_buffer) {
     return out_buffer->capacity - out_buffer->byte_pos - (out_buffer->bit_pos == 0 ? 0 : 1);
 }
 
-void gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, GifArena *arena) {
+void gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, void *arena) {
     isize new_capacity = isize_max(
         min_capacity,
         out_buffer->capacity + GIF_OUT_BUFFER_MIN_CAPACITY
     );
     assert(new_capacity > out_buffer->capacity);
 
-    u8 *new_buffer = gif_arena_realloc(
+    u8 *new_buffer = arena_realloc(
         arena,
         out_buffer->data,
         out_buffer->capacity,
@@ -989,7 +1048,7 @@ struct GifEncoder {
     ColorArray current_sequence;
 };
 
-static void gif_encoder_init(GifEncoder *encoder, GifArena *arena) {
+static void gif_encoder_init(GifEncoder *encoder, Arena *arena) {
     encoder->state = GIF_ENCODER_IDLE;
     encoder->global_color_count = 0;
     encoder->local_color_count = 0;
@@ -1011,7 +1070,7 @@ static void gif_encoder_init(GifEncoder *encoder, GifArena *arena) {
     // Minus 2 for the clear and end codes.
     isize max_sequence_size = 1 + ((MAX_LZW_CODE + 1) - 4);
     isize total_color_count = 1 + 1 + (2 + max_sequence_size) * (max_sequence_size - 2 + 1) / 2;
-    u8 *sequence_memory = gif_arena_alloc(arena, total_color_count * sizeof(GifColorIndex));
+    u8 *sequence_memory = arena_alloc(arena, total_color_count * sizeof(GifColorIndex));
     encoder->color_sequence_arena.data = sequence_memory;
     encoder->color_sequence_arena.size = 0;
     encoder->color_sequence_arena.capacity = total_color_count;
@@ -1019,31 +1078,31 @@ static void gif_encoder_init(GifEncoder *encoder, GifArena *arena) {
     // We will need at most 4096 buckets (24 bytes per bucket), allocate twice this amount:
     // 24 * 4096 * 2 = 196608 bytes = 192 KiB
     isize lzw_bucket_count = 2 * (MAX_LZW_CODE + 1);
-    encoder->lzw_table.buckets = gif_arena_alloc(arena, lzw_bucket_count * sizeof(LzwTableBucket));
+    encoder->lzw_table.buckets = arena_alloc(arena, lzw_bucket_count * sizeof(LzwTableBucket));
     encoder->lzw_table.sequence_count = 0;
     encoder->lzw_table.bucket_count = lzw_bucket_count;
 
     // Additionally 4093 bytes for the max sequence of the currently accumulated image colors.
-    encoder->current_sequence.indices = gif_arena_alloc(arena, max_sequence_size);
+    encoder->current_sequence.indices = arena_alloc(arena, max_sequence_size);
     encoder->current_sequence.count = 0;
     encoder->current_sequence.capacity = max_sequence_size;
 }
 
 isize gif_encoder_required_memory(void) {
     uptr isize_max = ~(usize)0 >> 1;
-    GifArena fake_arena = {
+    Arena fake_arena = {
         .begin = 0,
         .end = (u8 *)isize_max,
     };
 
-    GifEncoder *encoder = gif_arena_alloc(&fake_arena, sizeof(GifEncoder));
+    GifEncoder *encoder = arena_alloc(&fake_arena, sizeof(GifEncoder));
     gif_encoder_init(encoder, &fake_arena);
 
     return (isize)fake_arena.begin;
 }
 
-GifEncoder *gif_encoder_create(GifArena *arena) {
-    GifEncoder *encoder = gif_arena_alloc(arena, sizeof(GifEncoder));
+GifEncoder *gif_encoder_create(void *arena) {
+    GifEncoder *encoder = arena_alloc(arena, sizeof(GifEncoder));
     gif_encoder_init(encoder, arena);
 
     // Amounts to a delay of 1 second.
