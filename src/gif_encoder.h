@@ -90,7 +90,7 @@ f32 *palette_by_median_cut(
 f32 *palette_by_k_means(
     f32 const *pixels, isize pixel_count,
     isize target_color_count,
-    isize *color_count,
+    isize *colors_generated,
     void *arena
 );
 
