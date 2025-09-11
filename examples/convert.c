@@ -4,6 +4,7 @@
 //        [-memory <arena size in MiB>]
 //        [-color-space (srgb|linear|lab|oklab)]
 //        [-palette (web-safe|monochrome|black-white|<file>)]
+//        [-palette-gen (median-cut|k-means)]
 //        [-color-count <generated palette color count>]
 
 #include <stdlib.h>     // malloc, free
@@ -61,6 +62,7 @@ int main(int arg_count, char **args) {
 
     ColorSpace color_space = SRGB;
     enum { WEB_SAFE, MONOCHROME, BLACK_WHITE, GENERATE, FROM_FILE } palette = GENERATE;
+    enum { MEDIAN_CUT, K_MEANS } palette_gen = MEDIAN_CUT;
     char const *palette_file_name = NULL;
     isize max_color_count = 256;
 
@@ -115,6 +117,17 @@ int main(int arg_count, char **args) {
                 fprintf(stderr, "Invalid color count: '%s'\n", color_count_arg);
                 return 1;
             }
+        } else if (strcmp(args[i], "-palette-gen") == 0 && i + 1 < arg_count) {
+            char *palette_gen_arg = args[++i];
+
+            if (strcmp(palette_gen_arg, "median-cut") == 0) {
+                palette_gen = MEDIAN_CUT;
+            } else if (strcmp(palette_gen_arg, "k-means") == 0) {
+                palette_gen = K_MEANS;
+            } else {
+                fprintf(stderr, "Invalid palette generation method: '%s'\n", palette_gen_arg);
+                return 1;
+            }
         } else {
             fprintf(stderr, "Unknown or invalid option: '%s'\n", args[i]);
             return 1;
@@ -166,12 +179,26 @@ int main(int arg_count, char **args) {
         srgb_colors = palette_gen(&color_count, &arena);
         colors = from_srgb(srgb_colors, color_count, color_space, &arena);
     } else if (palette == GENERATE) {
-        colors = palette_by_median_cut(
-            pixels, image_width * image_height,
-            max_color_count,
-            &color_count,
-            &arena
-        );
+        switch (palette_gen) {
+        case MEDIAN_CUT: {
+            colors = palette_by_median_cut(
+                pixels, image_width * image_height,
+                max_color_count,
+                &color_count,
+                &arena
+            );
+        } break;
+
+        case K_MEANS: {
+            colors = palette_by_k_means(
+                pixels, image_width * image_height,
+                max_color_count,
+                &color_count,
+                &arena
+            );
+        } break;
+        }
+
         srgb_colors = into_srgb(colors, color_count, color_space, &arena);
     } else if (palette == FROM_FILE) {
         int palette_width, palette_height;

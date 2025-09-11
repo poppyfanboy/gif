@@ -10,6 +10,7 @@
 // TODO: Color search: sort colors along 3 axis, first check colors which have closer projections.
 // TODO: Try using K-means clustering instead of median-cut?
 // TODO: Implement dithering? I don't know how it's done (though, random one should be easy).
+// TODO: Pass the number of color components in arguments (1 for monochrome, 3 for RGB, 4 for RGBA).
 
 #include "gif_encoder.h"
 
@@ -17,11 +18,41 @@
 #include <stdlib.h> // qsort
 #include <stddef.h> // size_t, NULL
 #include <math.h>   // copysignf, powf, roundf, isnan, nanf, cbrtf, INFINITY
-#include <string.h> // memmove, memset, memcmp
+#include <string.h> // memmove, memcpy, memset, memcmp
 
 #define sizeof(expr) (isize)sizeof(expr)
 #define lengthof(string) (sizeof(string) - 1)
 #define countof(expr) (sizeof(expr) / sizeof((expr)[0]))
+
+// *Really* minimal PCG32 code / (c) 2014 M.E. O'Neill / pcg-random.org
+// Licensed under Apache License 2.0 (NO WARRANTY, etc. see website)
+
+typedef struct { uint64_t state;  uint64_t inc; } pcg32_random_t;
+
+uint32_t pcg32_random_r(pcg32_random_t* rng)
+{
+    uint64_t oldstate = rng->state;
+    // Advance internal state
+    rng->state = oldstate * 6364136223846793005ULL + (rng->inc|1);
+    // Calculate output function (XSH RR), uses old state for max ILP
+    uint32_t xorshifted = ((oldstate >> 18u) ^ oldstate) >> 27u;
+    uint32_t rot = oldstate >> 59u;
+    return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
+}
+
+void pcg32_srandom_r(pcg32_random_t* rng, uint64_t initstate, uint64_t initseq)
+{
+    rng->state = 0U;
+    rng->inc = (initseq << 1u) | 1u;
+    pcg32_random_r(rng);
+    rng->state += initstate;
+    pcg32_random_r(rng);
+}
+
+f64 f64_random(pcg32_random_t *rng) {
+    // Multiply by 2^(-32).
+    return (f64)pcg32_random_r(rng) * 0x1p-32;
+}
 
 #define ARENA_ALIGNMENT 16
 
@@ -487,7 +518,7 @@ static inline bool f32x3_equals(f32x3 left, f32x3 right) {
 typedef f32x3 ColorSetBucket;
 
 static inline bool color_set_bucket_empty(ColorSetBucket bucket) {
-    return isnan(bucket.x) || isnan(bucket.y) || isnan(bucket.z);
+    return isnan(bucket.x);
 }
 
 typedef struct {
@@ -519,6 +550,14 @@ static inline isize isize_min(isize left, isize right) {
 
 static inline isize isize_max(isize left, isize right) {
     return left > right ? left : right;
+}
+
+static inline isize isize_abs(isize value) {
+    if (value >= 0) {
+        return value;
+    } else {
+        return -value;
+    }
 }
 
 static int f32x3_compare_x_only(void const *left_ptr, void const *right_ptr) {
@@ -719,6 +758,266 @@ f32 *palette_by_median_cut(
 
     arena_rewind(arena, snapshot);
     *color_count = queue.count;
+    return palette;
+}
+
+typedef struct {
+    // -1, because I'm using signed sizes.
+    f32x3 *chunks[sizeof(usize) * 8 - 1];
+
+    // chunk_pos is the next available array index within the current chunk.
+    isize current_chunk;
+    isize chunk_pos;
+} ChunkedArray;
+
+f32 *palette_by_k_means(
+    f32 const *pixels, isize pixel_count,
+    isize target_color_count,
+    isize *color_count,
+    void *arena_void
+) {
+    Arena *arena = arena_void;
+
+    f32 *palette = arena_alloc(arena, target_color_count * COMPONENTS_PER_COLOR * sizeof(f32));
+    if (palette == NULL) {
+        *color_count = 0;
+        return NULL;
+    }
+
+    Arena snapshot = arena_snapshot(arena);
+
+    // Free space left from deallocated hash sets.
+    Arena free_space = {.begin = arena->begin, .end = arena->begin};
+
+    ColorSet color_set = {0};
+    color_set.bucket_count = 1024;
+    color_set.buckets = arena_alloc(arena, 1024 * sizeof(ColorSetBucket));
+    if (color_set.buckets == NULL) {
+        *color_count = 0;
+        return NULL;
+    }
+    for (isize i = 0; i < color_set.bucket_count; i += 1) {
+        color_set.buckets[i].x = nanf("");
+    }
+
+    f32 const *pixel_iter = pixels;
+    f32 const *pixels_end = pixels + COMPONENTS_PER_COLOR * pixel_count;
+    while (pixel_iter < pixels_end) {
+        if ((f32)color_set.color_count / color_set.bucket_count > 0.75F) {
+            // The growth factor is set to 1.5 so that the free_space arena eventually grows large
+            // enough to fit a new rehashed hashset.
+            isize new_bucket_count = color_set.bucket_count * 3 / 2;
+
+            ColorSetBucket *new_buckets = NULL;
+            if (arena_memory_left(&free_space) >= new_bucket_count * sizeof(ColorSetBucket)) {
+                new_buckets = (ColorSetBucket *)free_space.begin;
+                arena->begin = free_space.end;
+                free_space.end = free_space.begin;
+            } else {
+                new_buckets = arena_alloc(arena, new_bucket_count * sizeof(ColorSetBucket));
+                free_space.end += color_set.bucket_count * sizeof(ColorSetBucket);
+            }
+            if (new_buckets == NULL) {
+                *color_count = 0;
+                return NULL;
+            }
+
+            for (isize i = 0; i < new_bucket_count; i += 1) {
+                new_buckets[i].x = nanf("");
+            }
+
+            ColorSet new_color_set = {
+                .buckets = new_buckets,
+                .bucket_count = new_bucket_count,
+                .color_count = 0,
+            };
+            for (isize i = 0; i < color_set.bucket_count; i += 1) {
+                if (!color_set_bucket_empty(color_set.buckets[i])) {
+                    color_set_insert(&new_color_set, color_set.buckets[i]);
+                }
+            }
+            assert(color_set.color_count == new_color_set.color_count);
+
+            color_set = new_color_set;
+        }
+
+        color_set_insert(&color_set, (f32x3){pixel_iter[0], pixel_iter[1], pixel_iter[2]});
+        pixel_iter += COMPONENTS_PER_COLOR;
+    }
+
+    arena_rewind(arena, snapshot);
+    f32x3 *colors = arena_alloc(arena, color_set.color_count * sizeof(f32x3));
+    f32x3 *colors_end = colors + color_set.color_count;
+
+    // We already have all of the colors in memory, so there is definitely enough space.
+    assert(colors != NULL);
+
+    {
+        f32x3 *color_iter = colors;
+        ColorSetBucket *bucket_iter = color_set.buckets;
+        while (bucket_iter < color_set.buckets + color_set.bucket_count) {
+            if (!color_set_bucket_empty(*bucket_iter)) {
+                assert(color_iter != colors_end);
+
+                *color_iter = *bucket_iter;
+                color_iter += 1;
+            }
+
+            bucket_iter += 1;
+        }
+        assert(color_iter == colors_end);
+    }
+
+    // In total the whole image contained less colors than we asked for.
+    if (colors_end - colors <= target_color_count) {
+        memcpy(palette, colors, (colors_end - colors) * sizeof(f32x3));
+        *color_count = colors_end - colors;
+        arena_rewind(arena, snapshot);
+        return palette;
+    }
+
+    // Pick the initial set of centroids randomly from the image colors.
+    isize centroid_count = target_color_count;
+    f32x3 *centroids = arena_alloc(arena, centroid_count * sizeof(f32x3));
+    f32x3 *new_centroids = arena_alloc(arena, centroid_count * sizeof(f32x3));
+    if (centroids == NULL || new_centroids == NULL) {
+        *color_count = 0;
+        return NULL;
+    }
+    pcg32_random_t rng;
+    pcg32_srandom_r(&rng, (u64)memcpy, (u64)memmove);
+    {
+        f32x3 *centroid_iter = centroids;
+        f32x3 *color_iter = colors;
+        for (isize i = 0; i < centroid_count; i += 1) {
+            isize next_color_index = f64_random(&rng) * (colors_end - color_iter);
+            assert(next_color_index < colors_end - color_iter);
+
+            *centroid_iter = color_iter[next_color_index];
+            centroid_iter += 1;
+
+            f32x3 swap = color_iter[next_color_index];
+            color_iter[next_color_index] = color_iter[0];
+            color_iter[0] = swap;
+            color_iter += 1;
+        }
+    }
+
+    isize cluster_count = centroid_count;
+    ChunkedArray *clusters = arena_alloc(arena, cluster_count * sizeof(ChunkedArray));
+    isize *previous_cluster_sizes = arena_alloc(arena, cluster_count * sizeof(isize));
+    if (clusters == NULL || previous_cluster_sizes == NULL) {
+        *color_count = 0;
+        return NULL;
+    }
+    for (isize i = 0; i < cluster_count; i += 1) {
+        memset(&clusters[i], 0, sizeof(ChunkedArray));
+    }
+    memset(previous_cluster_sizes, 0, cluster_count * sizeof(isize));
+
+    bool done = false;
+    while (!done) {
+        for (isize i = 0; i < cluster_count; i += 1) {
+            clusters[i].current_chunk = 0;
+            clusters[i].chunk_pos = 0;
+        }
+
+        f32x3 *color_iter = colors;
+        while (color_iter < colors_end) {
+            f32 min_distance =
+                (centroids[0].x - color_iter->x) * (centroids[0].x - color_iter->x) +
+                (centroids[0].y - color_iter->y) * (centroids[0].y - color_iter->y) +
+                (centroids[0].z - color_iter->z) * (centroids[0].z - color_iter->z);
+            isize closest_cluster_index = 0;
+
+            for (isize i = 1; i < cluster_count; i += 1) {
+                f32 distance =
+                    (centroids[i].x - color_iter->x) * (centroids[i].x - color_iter->x) +
+                    (centroids[i].y - color_iter->y) * (centroids[i].y - color_iter->y) +
+                    (centroids[i].z - color_iter->z) * (centroids[i].z - color_iter->z);
+                if (distance < min_distance) {
+                    min_distance = distance;
+                    closest_cluster_index = i;
+                }
+            }
+
+            ChunkedArray *cluster = &clusters[closest_cluster_index];
+            if (cluster->chunk_pos == (isize)1 << cluster->current_chunk) {
+                cluster->current_chunk += 1;
+                cluster->chunk_pos = 0;
+            }
+            if (cluster->current_chunk == countof(cluster->chunks)) {
+                *color_count = 0;
+                return NULL;
+            }
+            if (cluster->chunks[cluster->current_chunk] == NULL) {
+                isize new_chunk_size = (isize)1 << cluster->current_chunk;
+                f32x3 *new_chunk = arena_alloc(arena, new_chunk_size * sizeof(f32x3));
+                if (new_chunk == NULL) {
+                    *color_count = 0;
+                    return NULL;
+                }
+
+                cluster->chunks[cluster->current_chunk] = new_chunk;
+            }
+
+            cluster->chunks[cluster->current_chunk][cluster->chunk_pos++] = *color_iter;
+            color_iter += 1;
+        }
+
+        for (isize centroid_index = 0; centroid_index < centroid_count; centroid_index += 1) {
+            f64 x_sum = 0.0, y_sum = 0.0, z_sum = 0.0;
+            ChunkedArray *cluster = &clusters[centroid_index];
+
+            for (isize i = 0; i < cluster->current_chunk - 1; i += 1) {
+                for (isize j = 0; j < (isize)1 << i; j += 1) {
+                    x_sum += cluster->chunks[i][j].x;
+                    y_sum += cluster->chunks[i][j].y;
+                    z_sum += cluster->chunks[i][j].z;
+                }
+            }
+            for (isize i = 0; i < cluster->chunk_pos; i += 1) {
+                x_sum += cluster->chunks[cluster->current_chunk][i].x;
+                y_sum += cluster->chunks[cluster->current_chunk][i].y;
+                z_sum += cluster->chunks[cluster->current_chunk][i].z;
+            }
+
+            isize cluster_color_count = 0;
+            if (cluster->current_chunk > 0) {
+                cluster_color_count += ((isize)1 << (cluster->current_chunk - 1)) - 1;
+            }
+            cluster_color_count += cluster->chunk_pos;
+
+            new_centroids[centroid_index].x = x_sum / cluster_color_count;
+            new_centroids[centroid_index].y = y_sum / cluster_color_count;
+            new_centroids[centroid_index].z = z_sum / cluster_color_count;
+        }
+
+        isize changed_cluster_color_count = 0;
+        for (isize i = 0; i < cluster_count; i += 1) {
+            isize current_cluster_size = 0;
+            if (clusters[i].current_chunk > 0) {
+                current_cluster_size += ((isize)1 << (clusters[i].current_chunk - 1)) - 1;
+            }
+            current_cluster_size += clusters[i].chunk_pos;
+
+            changed_cluster_color_count +=
+                isize_abs(current_cluster_size - previous_cluster_sizes[i]);
+            previous_cluster_sizes[i] = current_cluster_size;
+        }
+        // Terminate after fewer than 1/400 of the pixels changed clusters after an iteration.
+        if (changed_cluster_color_count <= (colors_end - colors) / 400) {
+            break;
+        }
+
+        f32x3 *swap = centroids;
+        centroids = new_centroids;
+        new_centroids = swap;
+    }
+
+    memcpy(palette, centroids, centroid_count * sizeof(f32x3));
+    *color_count = centroid_count;
+    arena_rewind(arena, snapshot);
     return palette;
 }
 

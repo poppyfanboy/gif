@@ -79,7 +79,15 @@ f32 *srgb_to_oklab(u8 const *srgb_colors, isize color_count, void *arena);
 u8 *oklab_to_srgb(f32 const *oklab_colors, isize color_count, void *arena);
 
 // Generate a custom color palette that best fits the given image.
+
 f32 *palette_by_median_cut(
+    f32 const *pixels, isize pixel_count,
+    isize target_color_count,
+    isize *color_count,
+    void *arena
+);
+
+f32 *palette_by_k_means(
     f32 const *pixels, isize pixel_count,
     isize target_color_count,
     isize *color_count,

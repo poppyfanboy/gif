@@ -1,7 +1,9 @@
 # This ignores everything, including the folders.
 *
-# This un-ignores the folders.
-!*/
+
+# Un-ignore only the source code folders.
+!src/
+!examples/
 
 # Only keep the source code files.
 !*.c
