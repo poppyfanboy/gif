@@ -14,16 +14,36 @@
 #include <stdlib.h>     // strtoll
 #include <errno.h>      // errno, ERANGE
 #include <stdbool.h>    // bool, true, false
+#include <setjmp.h>     // jmp_buf, setjmp, longjmp
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
 #include "../src/gif_encoder.h"
 
+#define countof(array) sizeof(array) / sizeof((array)[0])
+
 typedef struct {
     u8 *begin;
     u8 *end;
+
+    u8 *arena_begin;
+    u8 *high_water_mark;
+    jmp_buf out_of_memory_jump;
 } Arena;
+
+void arena_report_alloc(void *arena_void, isize size) {
+    Arena *arena = arena_void;
+
+    isize const ARENA_ALIGNMENT = 16;
+    isize padding = (~(uptr)arena->begin + 1) & (ARENA_ALIGNMENT - 1);
+
+    if (arena->end - arena->begin - padding < size) {
+        longjmp(arena->out_of_memory_jump, 1);
+    } else if (arena->high_water_mark < arena->begin + size + padding) {
+        arena->high_water_mark = arena->begin + size + padding;
+    }
+}
 
 typedef enum { SRGB, LINEAR, LAB, OKLAB } ColorSpace;
 
@@ -143,7 +163,18 @@ int main(int arg_count, char **args) {
         fprintf(stderr, "Failed to allocate memory for the arena.\n");
         return 1;
     }
-    Arena arena = {arena_memory, arena_memory + arena_capacity};
+
+    Arena arena = {
+        .begin = arena_memory,
+        .end = arena_memory + arena_capacity,
+
+        .arena_begin = arena_memory,
+        .high_water_mark = arena_memory,
+    };
+    if (setjmp(arena.out_of_memory_jump)) {
+        fprintf(stderr, "Ran out of memory.\n");
+        return 1;
+    }
 
     // Read the pixels from the file.
 
@@ -157,10 +188,6 @@ int main(int arg_count, char **args) {
         }
 
         pixels = from_srgb(srgb_pixels, image_width * image_height, color_space, &arena);
-        if (pixels == NULL) {
-            fprintf(stderr, "Ran out of memory.\n");
-            return 1;
-        }
     }
 
     // Pick a color palette.
@@ -216,10 +243,6 @@ int main(int arg_count, char **args) {
 
         colors = from_srgb(srgb_colors, color_count, color_space, &arena);
     }
-    if (colors == NULL || srgb_colors == NULL) {
-        fprintf(stderr, "Ran out of memory.\n");
-        return 1;
-    }
 
     // Quantize the image using the picked color palette.
 
@@ -228,10 +251,6 @@ int main(int arg_count, char **args) {
         colors, color_count,
         &arena
     );
-    if (indexed_pixels == NULL) {
-        fprintf(stderr, "Ran out of memory.\n");
-        return 1;
-    }
 
     // Encode the GIF.
 
@@ -243,10 +262,6 @@ int main(int arg_count, char **args) {
 
     GifEncoder *encoder = gif_encoder_create(&arena);
     GifOutputBuffer *out_buffer = gif_out_buffer_create(64 * 1024, &arena);
-    if (encoder == NULL || out_buffer == NULL) {
-        fprintf(stderr, "Ran out of memory.\n");
-        return 1;
-    }
 
     gif_encoder_start(encoder, image_width, image_height, srgb_colors, color_count, out_buffer);
     {
@@ -278,6 +293,28 @@ int main(int arg_count, char **args) {
 
     fwrite(out_buffer->data, 1, (size_t)out_buffer->encoded_size, output_file);
     fclose(output_file);
+
+    char const *units[] = {"B", "KiB", "MiB", "GiB"};
+
+    f64 max_usage = arena.high_water_mark - arena.arena_begin;
+    char const **max_usage_unit = units;
+    while (max_usage_unit < units + countof(units) - 1 && max_usage > 1.2e3) {
+        max_usage *= 0x1p-10;
+        max_usage_unit += 1;
+    }
+
+    f64 max_memory = arena.end - arena.arena_begin;
+    char const **max_memory_unit = units;
+    while (max_memory_unit < units + countof(units) - 1 && max_memory > 1.2e3) {
+        max_memory *= 0x1p-10;
+        max_memory_unit += 1;
+    }
+
+    printf(
+        "Peak memory usage: %.2f %s / %.2f %s\n",
+        max_usage, *max_usage_unit,
+        max_memory, *max_memory_unit
+    );
 
     return 0;
 }

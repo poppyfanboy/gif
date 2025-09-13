@@ -3,6 +3,11 @@
 //  - Functions which create or allocate something will return NULL if you run out of memory.
 //  - Call encoder functions only when you have enough memory (see GIF_OUT_BUFFER_MIN_CAPACITY).
 //
+// Customizing allocation:
+//  You can provide a custom hook which is called right before allocating memory from the arena.
+//  Provide the function name at compile time with the GIF_LIB_REPORT_ALLOC define.
+//  Hook signature: void report_alloc(void *arena, isize size)
+//
 // https://nullprogram.com/blog/2023/09/27
 // I liked this guy's idea of using arenas in the library interface as opposed to abstracting
 // allocation behind an ad hoc VMT malloc/realloc/free interface, and decided to try it out myself.

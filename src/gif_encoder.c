@@ -61,19 +61,44 @@ typedef struct {
     u8 *end;
 } Arena;
 
-static inline Arena arena_snapshot(Arena *arena) {
-    return *arena;
+// Just the "begin" pointer. The "end" pointer never changes after an allocation anyway.
+typedef u8 *ArenaSnapshot;
+
+static inline ArenaSnapshot arena_snapshot(Arena *arena) {
+    return arena->begin;
 }
 
-static inline void arena_rewind(Arena *arena, Arena snapshot) {
-    *arena = snapshot;
+static inline void arena_rewind(Arena *arena, ArenaSnapshot snapshot) {
+    arena->begin = snapshot;
 }
 
 static inline isize arena_memory_left(Arena *arena) {
     return arena->end - arena->begin;
 }
 
+// Optional user-defined pre-allocation hook.
+// Allows the user to define an out-of-memory behavior, as well as tracking the max memory usage.
+//
+// The user can also add more members to the arena struct if needed. Technically, I think this would
+// violate strict aliasing, because then definitions of the arena struct would differ here in
+// library code and in user code (despite both of them having the same starting sequence of fields).
+//
+// I believe there is an ugly way to avoid the UB (remove Arena struct definition from the library
+// code and access the "begin" and "end" fields via memcpy), but I don't want to bother with it.
+
+#ifndef GIF_LIB_REPORT_ALLOC
+    #define GIF_LIB_REPORT_ALLOC(arena, size)
+#else
+    void GIF_LIB_REPORT_ALLOC(void *arena, isize size);
+#endif
+
 static void *arena_alloc(Arena *arena, isize size) {
+    // Avoid reporting allocations on the "fake" arena which is used for calculating memory usage.
+    const uptr UPTR_MAX = ~(uptr)0;
+    if ((uptr)arena->end != UPTR_MAX) {
+        GIF_LIB_REPORT_ALLOC(arena, size);
+    }
+
     if (size == 0) {
         return NULL;
     }
@@ -595,7 +620,7 @@ f32 *palette_by_median_cut(
         return NULL;
     }
 
-    Arena snapshot = arena_snapshot(arena);
+    ArenaSnapshot snapshot = arena_snapshot(arena);
 
     // TODO: I don't like this hashset capacity estimate, the test image only uses around 2% of the
     // allocated buckets. And also keep in mind that you will have to iterate over the entire list
@@ -777,7 +802,7 @@ f32 *palette_by_k_means(
         return NULL;
     }
 
-    Arena snapshot = arena_snapshot(arena);
+    ArenaSnapshot snapshot = arena_snapshot(arena);
 
     // Free space left from deallocated hash sets.
     Arena free_space = {.begin = arena->begin, .end = arena->begin};
@@ -1137,7 +1162,7 @@ GifColorIndex *image_quantize_for_gif(
         return NULL;
     }
 
-    Arena snapshot = arena_snapshot(arena);
+    ArenaSnapshot snapshot = arena_snapshot(arena);
 
     IndexedColor *indexed_colors = arena_alloc(arena, color_count * sizeof(IndexedColor));
     if (indexed_colors == NULL) {
@@ -1444,10 +1469,10 @@ static void gif_encoder_init(GifEncoder *encoder, Arena *arena) {
 }
 
 isize gif_encoder_required_memory(void) {
-    uptr isize_max = ~(usize)0 >> 1;
+    uptr const UPTR_MAX = ~(uptr)0;
     Arena fake_arena = {
         .begin = 0,
-        .end = (u8 *)isize_max,
+        .end = (u8 *)UPTR_MAX,
     };
 
     GifEncoder encoder = {0};
