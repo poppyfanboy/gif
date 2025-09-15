@@ -3,14 +3,14 @@
 // - https://en.wikipedia.org/wiki/GIF
 // - https://web.archive.org/web/20180620143135/https://www.vurdalakov.net/misc/gif/netscape-looping-application-extension
 
-// TODO: Measure how much time (and memory) does each stage of converting an image to GIF take.
-// TODO: Split hashset into multiple smaller ones when searching for unique colors in median-cut?
+// TODO: Try implementing an improved version of median-cut algorithm from Leptonica (MMCQ).
 // TODO: Transdiff from ffmpeg: unchanged pixels are encoded as transparent on next frame.
 // TODO: Color search: partition space, create list of possible closest colors for each partition.
 // TODO: Color search: sort colors along 3 axis, first check colors which have closer projections.
-// TODO: Try using K-means clustering instead of median-cut?
+// TODO: Try using a prefix tree for storing the mapping from color sequences to LZW codes.
 // TODO: Implement dithering? I don't know how it's done (though, random one should be easy).
 // TODO: Pass the number of color components in arguments (1 for monochrome, 3 for RGB, 4 for RGBA).
+// TODO: Try using k-means++ for picking an initial set of centroids in k-means.
 
 #include "gif_encoder.h"
 
@@ -19,10 +19,6 @@
 #include <stddef.h> // size_t, NULL
 #include <math.h>   // copysignf, powf, roundf, isnan, nanf, cbrtf, INFINITY
 #include <string.h> // memmove, memcpy, memset, memcmp
-
-#define sizeof(expr) (isize)sizeof(expr)
-#define lengthof(string) (sizeof(string) - 1)
-#define countof(expr) (sizeof(expr) / sizeof((expr)[0]))
 
 // *Really* minimal PCG32 code / (c) 2014 M.E. O'Neill / pcg-random.org
 // Licensed under Apache License 2.0 (NO WARRANTY, etc. see website)
@@ -52,6 +48,50 @@ static void pcg32_srandom_r(pcg32_random_t* rng, uint64_t initstate, uint64_t in
 static f64 f64_random(pcg32_random_t *rng) {
     // Multiply by 2^(-32).
     return (f64)pcg32_random_r(rng) * 0x1p-32;
+}
+
+
+#define sizeof(expr) (isize)sizeof(expr)
+#define lengthof(string) (sizeof(string) - 1)
+#define countof(expr) (sizeof(expr) / sizeof((expr)[0]))
+
+#define USIZE_BITS ((int)sizeof(usize) * 8)
+
+#if defined(__clang__) || defined(__GNUC__)
+    #define u32_leading_zeroes __builtin_clz
+    #define u64_leading_zeroes __builtin_clzll
+#elif defined(_MSC_VER)
+    #define u32_leading_zeroes __lzcnt
+    #define u64_leading_zeroes __lzcnt64
+#else
+    #define u32_leading_zeroes u32_leading_zeroes_impl
+    #define u64_leading_zeroes u64_leading_zeroes_impl
+#endif
+
+static int u32_leading_zeroes_impl(u32 value) {
+    int leading_zeroes = 0;
+    while (value != 0) {
+        value >>= 1;
+        leading_zeroes += 1;
+    }
+    return 32 - leading_zeroes;
+}
+
+static int u64_leading_zeroes_impl(u64 value) {
+    int leading_zeroes = 0;
+    while (value != 0) {
+        value >>= 1;
+        leading_zeroes += 1;
+    }
+    return 64 - leading_zeroes;
+}
+
+static inline int usize_leading_zeroes(usize value) {
+    if (sizeof(usize) == 8) {
+        return u64_leading_zeroes(value);
+    } else {
+        return u32_leading_zeroes(value);
+    }
 }
 
 #define ARENA_ALIGNMENT 16
@@ -520,53 +560,247 @@ u8 *oklab_to_srgb(f32 const *oklab_colors, isize color_count, void *arena) {
     return srgb_colors;
 }
 
-// Based on djb2 hashing function:
-// http://www.cse.yorku.ca/~oz/hash.html
-static u32 f32x3_hash(f32x3 value) {
-    u32 hash = 5381;
-
-    u8 const *value_iter = (u8 const *)&value;
-    u8 const *value_end = (u8 const *)&value + sizeof(f32x3);
-    while (value_iter != value_end) {
-        hash = ((hash << 5) + hash) + *value_iter;
-        value_iter += 1;
-    }
-
-    return hash;
-}
-
-static inline bool f32x3_equals(f32x3 left, f32x3 right) {
-    return left.x == right.x && left.y == right.y && left.z == right.z;
-}
-
-// First color component set to NaN indicates an empty bucket.
-typedef f32x3 ColorSetBucket;
-
-static inline bool color_set_bucket_empty(ColorSetBucket bucket) {
-    return isnan(bucket.x);
-}
-
+// Arrays in here are split into chunks. The chunk sizes are as follows: 2^0, 2^1, 2^2, ...
+//
+// "indices" stores indices into "colors" array and represents a "color hashes -> colors" mapping.
+// Since there is going to be at most 2^32 colors, 32-bit indices will do.
+// The number of indices always coincides with the capacity, no need to store them separately.
 typedef struct {
-    ColorSetBucket *buckets;
-    isize bucket_count;
+    i32 *indices[USIZE_BITS];
+    isize index_count;
+
+    u8 *colors[USIZE_BITS];
     isize color_count;
+    isize color_capacity;
 } ColorSet;
 
-static void color_set_insert(ColorSet *colors, f32x3 new_color) {
-    assert(colors->color_count < colors->bucket_count);
+// Calculate the location of an item at index "item_index" within the chunked array.
+// (e.g. the "item_index"-th index is located at indices[chunk][chunk_pos].)
+static inline void chunk_pos(isize item_index, isize *chunk, isize *chunk_pos) {
+    *chunk = USIZE_BITS - usize_leading_zeroes(item_index + 1) - 1;
+    *chunk_pos = (item_index + 1) - (1 << *chunk);
+}
 
-    isize bucket_index = f32x3_hash(new_color) % colors->bucket_count;
-    while (
-        !color_set_bucket_empty(colors->buckets[bucket_index]) &&
-        !f32x3_equals(colors->buckets[bucket_index], new_color)
-    ) {
-        bucket_index = (bucket_index + 1) % colors->bucket_count;
+// https://nullprogram.com/blog/2018/07/31/
+static u32 color_hash(u8 const *color) {
+    u32 hash = (u32)color[0] << 16 | (u32)color[1] << 8 | color[2];
+
+    hash = (hash ^ hash >> 17) * 0xed5ad4bb;
+    hash = (hash ^ hash >> 11) * 0xac4c1b51;
+    hash = (hash ^ hash >> 15) * 0x31848bab;
+    return  hash ^ hash >> 14;
+}
+
+// Returns false when it fails to allocate memory from the arena.
+static bool color_set_append(
+    ColorSet *color_set,
+    u8 const *colors, isize color_count,
+    void *arena
+) {
+    u8 const *color_iter = colors;
+    u8 const *colors_end = colors + color_count * COMPONENTS_PER_COLOR;
+    while (color_iter < colors_end) {
+        u8 next_color[3] = {color_iter[0], color_iter[1], color_iter[2]};
+
+        // The load factor has become greater than 2/3.
+        if (color_set->color_count * 3 > color_set->index_count * 2) {
+            isize new_chunk, new_chunk_pos;
+            chunk_pos(color_set->index_count, &new_chunk, &new_chunk_pos);
+
+            isize new_chunk_size = 1 << new_chunk;
+            i32 *new_indices = arena_alloc(arena, new_chunk_size * sizeof(i32));
+            if (new_indices == NULL) {
+                return false;
+            }
+
+            color_set->indices[new_chunk] = new_indices;
+            color_set->index_count += new_chunk_size;
+
+            for (isize i = 0; i <= new_chunk; i += 1) {
+                memset(color_set->indices[i], -1, (1 << i) * sizeof(i32));
+            }
+            for (i32 color_index = 0; color_index < color_set->color_count; color_index += 1) {
+                isize color_chunk, color_chunk_pos;
+                chunk_pos(color_index, &color_chunk, &color_chunk_pos);
+                u8 *color = &color_set->colors[color_chunk][color_chunk_pos * COMPONENTS_PER_COLOR];
+
+                isize bucket_index = color_hash(color) % color_set->index_count;
+                while (true) {
+                    isize index_chunk, index_chunk_pos;
+                    chunk_pos(bucket_index, &index_chunk, &index_chunk_pos);
+                    i32 *bucket = &color_set->indices[index_chunk][index_chunk_pos];
+                    if (*bucket < 0) {
+                        *bucket = color_index;
+                        break;
+                    }
+
+                    bucket_index = (bucket_index + 1) % color_set->index_count;
+                }
+            }
+        }
+        assert(color_set->color_count * 3 <= color_set->index_count * 2);
+
+        isize bucket_index = color_hash(next_color) % color_set->index_count;
+        i32 *bucket;
+        while (true) {
+            isize index_chunk, index_chunk_pos;
+            chunk_pos(bucket_index, &index_chunk, &index_chunk_pos);
+            bucket = &color_set->indices[index_chunk][index_chunk_pos];
+            if (*bucket < 0) {
+                break;
+            }
+
+            isize color_chunk, color_chunk_pos;
+            chunk_pos(*bucket, &color_chunk, &color_chunk_pos);
+            u8 *color = &color_set->colors[color_chunk][color_chunk_pos * COMPONENTS_PER_COLOR];
+            if (
+                color[0] == next_color[0] && color[1] == next_color[1] && color[2] == next_color[2]
+            ) {
+                break;
+            }
+
+            bucket_index = (bucket_index + 1) % color_set->index_count;
+        }
+
+        if (*bucket < 0) {
+            // Ran out of the colors array capacity.
+            // Only allocate more memory for the colors when we actually need it.
+            if (color_set->color_count == color_set->color_capacity) {
+                isize new_chunk, new_chunk_pos;
+                chunk_pos(color_set->color_capacity, &new_chunk, &new_chunk_pos);
+                isize new_chunk_size = 1 << new_chunk;
+
+                u8 *new_colors = arena_alloc(
+                    arena,
+                    new_chunk_size * COMPONENTS_PER_COLOR * sizeof(u8)
+                );
+                if (new_colors == NULL) {
+                    return false;
+                }
+
+                color_set->colors[new_chunk] = new_colors;
+                color_set->color_capacity += new_chunk_size;
+            }
+
+            isize color_chunk, color_chunk_pos;
+            chunk_pos(color_set->color_count, &color_chunk, &color_chunk_pos);
+            u8 *color = &color_set->colors[color_chunk][color_chunk_pos * COMPONENTS_PER_COLOR];
+            color[0] = next_color[0];
+            color[1] = next_color[1];
+            color[2] = next_color[2];
+
+            *bucket = (i32)color_set->color_count;
+
+            color_set->color_count += 1;
+        }
+
+        color_iter += COMPONENTS_PER_COLOR;
     }
 
-    if (color_set_bucket_empty(colors->buckets[bucket_index])) {
-        colors->buckets[bucket_index] = new_color;
-        colors->color_count += 1;
+    return true;
+}
+
+u8 *colors_unique(u8 const *colors, isize color_count, isize *unique_color_count, void *arena) {
+    if (color_count == 0) {
+        *unique_color_count = 0;
+        return NULL;
     }
+
+    ArenaSnapshot snapshot = arena_snapshot(arena);
+
+    // Must be a positive integer in the for of (2^N - 1).
+    isize const INITIAL_CAPACITY = 63;
+
+    // Allocate some memory for the indices and colors from the get-go.
+    i32 *initial_indices = arena_alloc(arena, INITIAL_CAPACITY * sizeof(i32));
+    u8 *initial_colors = arena_alloc(arena, INITIAL_CAPACITY * COMPONENTS_PER_COLOR * sizeof(u8));
+    if (initial_indices == NULL || initial_colors == NULL) {
+        *unique_color_count = 0;
+        return NULL;
+    }
+    memset(initial_indices, -1, INITIAL_CAPACITY * sizeof(i32));
+
+    ColorSet color_set = {
+        .color_count = 0,
+        .color_capacity = INITIAL_CAPACITY,
+        .index_count = INITIAL_CAPACITY,
+    };
+    for (int i = 0; i < USIZE_BITS - usize_leading_zeroes(INITIAL_CAPACITY); i += 1) {
+        color_set.colors[i] = &initial_colors[((1 << i) - 1) * COMPONENTS_PER_COLOR];
+    }
+    for (int i = 0; i < USIZE_BITS - usize_leading_zeroes(INITIAL_CAPACITY); i += 1) {
+        color_set.indices[i] = &initial_indices[(1 << i) - 1];
+    }
+
+    if (!color_set_append(&color_set, colors, color_count, arena)) {
+        *unique_color_count = 0;
+        return NULL;
+    }
+
+    // Write over the hash set memory.
+    arena_rewind(arena, snapshot);
+    u8 *unique_colors = arena_alloc(
+        arena,
+        color_set.color_count * COMPONENTS_PER_COLOR * sizeof(u8)
+    );
+
+    u8 *unique_color_iter = unique_colors;
+    for (isize color_index = 0; color_index < color_set.color_count; color_index += 1) {
+        isize color_chunk, color_chunk_pos;
+        chunk_pos(color_index, &color_chunk, &color_chunk_pos);
+        u8 *color = &color_set.colors[color_chunk][color_chunk_pos * COMPONENTS_PER_COLOR];
+
+        unique_color_iter[0] = color[0];
+        unique_color_iter[1] = color[1];
+        unique_color_iter[2] = color[2];
+
+        unique_color_iter += COMPONENTS_PER_COLOR;
+    }
+
+    *unique_color_count = color_set.color_count;
+    return unique_colors;
+}
+
+u8 *colors_unique_inplace(u8 *colors, isize color_count, isize *unique_color_count, void *arena) {
+    if (color_count == 0) {
+        *unique_color_count = 0;
+        return NULL;
+    }
+
+    ArenaSnapshot snapshot = arena_snapshot(arena);
+
+    ColorSet color_set;
+
+    // Must be a positive integer in the for of (2^N - 1).
+    isize const INITIAL_INDEX_COUNT = 63;
+    i32 *initial_indices = arena_alloc(arena, INITIAL_INDEX_COUNT * sizeof(i32));
+    if (initial_indices == NULL) {
+        *unique_color_count = 0;
+        return NULL;
+    }
+    memset(initial_indices, -1, INITIAL_INDEX_COUNT * sizeof(i32));
+
+    color_set.index_count = INITIAL_INDEX_COUNT;
+    for (int i = 0; i < USIZE_BITS - usize_leading_zeroes(INITIAL_INDEX_COUNT); i += 1) {
+        color_set.indices[i] = &initial_indices[(1 << i) - 1];
+    }
+
+    color_set.color_count = 0;
+    color_set.color_capacity = color_count;
+    isize color_chunk, color_chunk_pos;
+    chunk_pos(color_count - 1, &color_chunk, &color_chunk_pos);
+    for (int i = 0; i <= color_chunk; i += 1) {
+        color_set.colors[i] = &colors[((1 << i) - 1) * COMPONENTS_PER_COLOR];
+    }
+
+    if (!color_set_append(&color_set, colors, color_count, arena)) {
+        *unique_color_count = 0;
+        return NULL;
+    }
+
+    arena_rewind(arena, snapshot);
+    *unique_color_count = color_set.color_count;
+    return color_set.colors[0];
 }
 
 static inline isize isize_min(isize left, isize right) {
@@ -607,72 +841,27 @@ static int f32x3_compare_z_only(void const *left_ptr, void const *right_ptr) {
 }
 
 f32 *palette_by_median_cut(
-    f32 const *pixels, isize pixel_count,
+    f32 const *colors_raw, isize color_count,
     isize target_color_count,
-    isize *color_count,
+    isize *colors_generated,
     void *arena
 ) {
     assert(target_color_count <= GIF_MAX_COLORS);
 
     f32 *palette = arena_alloc(arena, target_color_count * COMPONENTS_PER_COLOR * sizeof(f32));
     if (palette == NULL) {
-        *color_count = 0;
+        *colors_generated = 0;
         return NULL;
     }
 
     ArenaSnapshot snapshot = arena_snapshot(arena);
 
-    // TODO: I don't like this hashset capacity estimate, the test image only uses around 2% of the
-    // allocated buckets. And also keep in mind that you will have to iterate over the entire list
-    // of buckets to extract the unique colors. Maybe rehashing here is not a bad idea after all?
-
-    ColorSet color_set;
-    color_set.color_count = 0;
-
-    // Worst case scenario: all pixels in the input image are different.
-    color_set.bucket_count = isize_min(pixel_count, 256 * 256 * 256) * 3 / 2;
-    color_set.buckets = arena_alloc(arena, color_set.bucket_count * sizeof(ColorSetBucket));
-    if (color_set.buckets == NULL) {
-        *color_count = 0;
-        return NULL;
-    }
-
-    // If the implementation does not support quiet NaNs, these functions return zero.
-    assert(nanf("") != 0.0F);
-    for (isize i = 0; i < color_set.bucket_count; i += 1) {
-        color_set.buckets[i].x = nanf("");
-        color_set.buckets[i].y = nanf("");
-        color_set.buckets[i].z = nanf("");
-    }
-
-    f32 const *pixel_iter = pixels;
-    f32 const *pixels_end = pixels + COMPONENTS_PER_COLOR * pixel_count;
-    while (pixel_iter < pixels_end) {
-        color_set_insert(&color_set, (f32x3){pixel_iter[0], pixel_iter[1], pixel_iter[2]});
-        pixel_iter += COMPONENTS_PER_COLOR;
-    }
-
-    f32x3 *colors = arena_alloc(arena, color_set.color_count * sizeof(f32x3));
+    f32x3 *colors = arena_alloc(arena, color_count * sizeof(f32x3));
     if (colors == NULL) {
-        *color_count = 0;
+        *colors_generated = 0;
         return NULL;
     }
-
-    f32x3 *color_iter = colors;
-    f32x3 *colors_end = colors + color_set.color_count;
-
-    ColorSetBucket *bucket_iter = color_set.buckets;
-    while (bucket_iter < color_set.buckets + color_set.bucket_count) {
-        if (!color_set_bucket_empty(*bucket_iter)) {
-            assert(color_iter != colors_end);
-
-            *color_iter = *bucket_iter;
-            color_iter += 1;
-        }
-
-        bucket_iter += 1;
-    }
-    assert(color_iter == colors_end);
+    memcpy(colors, colors_raw, color_count * sizeof(f32x3));
 
     typedef struct {
         f32x3 *begin;
@@ -691,7 +880,7 @@ f32 *palette_by_median_cut(
     queue.first_index = 0;
     queue.last_index = 0;
     queue.count = 1;
-    queue.segments[queue.first_index] = (Segment){colors, colors_end};
+    queue.segments[queue.first_index] = (Segment){colors, colors + color_count};
 
     while (queue.count < target_color_count) {
         assert(queue.count > 0);
@@ -782,12 +971,12 @@ f32 *palette_by_median_cut(
     }
 
     arena_rewind(arena, snapshot);
-    *color_count = queue.count;
+    *colors_generated = queue.count;
     return palette;
 }
 
 f32 *palette_by_k_means(
-    f32 const *pixels, isize pixel_count,
+    f32 const *colors_raw, isize color_count,
     isize target_color_count,
     isize *colors_generated,
     void *arena_void
@@ -802,89 +991,10 @@ f32 *palette_by_k_means(
         return NULL;
     }
 
+    f32x3 *colors = (f32x3 *)colors_raw;
+    f32x3 *colors_end = colors + color_count;
+
     ArenaSnapshot snapshot = arena_snapshot(arena);
-
-    // Free space left from deallocated hash sets.
-    Arena free_space = {.begin = arena->begin, .end = arena->begin};
-
-    ColorSet color_set = {0};
-    color_set.bucket_count = 1024;
-    color_set.buckets = arena_alloc(arena, 1024 * sizeof(ColorSetBucket));
-    if (color_set.buckets == NULL) {
-        *colors_generated = 0;
-        return NULL;
-    }
-    for (isize i = 0; i < color_set.bucket_count; i += 1) {
-        color_set.buckets[i].x = nanf("");
-    }
-
-    f32 const *pixel_iter = pixels;
-    f32 const *pixels_end = pixels + COMPONENTS_PER_COLOR * pixel_count;
-    while (pixel_iter < pixels_end) {
-        if ((f32)color_set.color_count / color_set.bucket_count > 0.75F) {
-            // The growth factor is set to 1.5 so that the free_space arena eventually grows large
-            // enough to fit a new rehashed hashset.
-            isize new_bucket_count = color_set.bucket_count * 3 / 2;
-
-            ColorSetBucket *new_buckets = NULL;
-            if (arena_memory_left(&free_space) >= new_bucket_count * sizeof(ColorSetBucket)) {
-                new_buckets = (ColorSetBucket *)free_space.begin;
-                arena->begin = free_space.end;
-                free_space.end = free_space.begin;
-            } else {
-                new_buckets = arena_alloc(arena, new_bucket_count * sizeof(ColorSetBucket));
-                free_space.end += color_set.bucket_count * sizeof(ColorSetBucket);
-            }
-            if (new_buckets == NULL) {
-                *colors_generated = 0;
-                return NULL;
-            }
-
-            for (isize i = 0; i < new_bucket_count; i += 1) {
-                new_buckets[i].x = nanf("");
-            }
-
-            ColorSet new_color_set = {
-                .buckets = new_buckets,
-                .bucket_count = new_bucket_count,
-                .color_count = 0,
-            };
-            for (isize i = 0; i < color_set.bucket_count; i += 1) {
-                if (!color_set_bucket_empty(color_set.buckets[i])) {
-                    color_set_insert(&new_color_set, color_set.buckets[i]);
-                }
-            }
-            assert(color_set.color_count == new_color_set.color_count);
-
-            color_set = new_color_set;
-        }
-
-        color_set_insert(&color_set, (f32x3){pixel_iter[0], pixel_iter[1], pixel_iter[2]});
-        pixel_iter += COMPONENTS_PER_COLOR;
-    }
-
-    arena_rewind(arena, snapshot);
-    f32x3 *colors = arena_alloc(arena, color_set.color_count * sizeof(f32x3));
-    isize color_count = color_set.color_count;
-
-    // We already have all of the colors in memory, so there is definitely enough space.
-    assert(colors != NULL);
-
-    {
-        f32x3 *color_iter = colors;
-        ColorSetBucket *bucket_iter = color_set.buckets;
-        while (bucket_iter < color_set.buckets + color_set.bucket_count) {
-            if (!color_set_bucket_empty(*bucket_iter)) {
-                assert(color_iter != colors + color_count);
-
-                *color_iter = *bucket_iter;
-                color_iter += 1;
-            }
-
-            bucket_iter += 1;
-        }
-        assert(color_iter == colors + color_count);
-    }
 
     // In total the whole image contained less colors than we asked for.
     if (color_count <= target_color_count) {
@@ -906,7 +1016,7 @@ f32 *palette_by_k_means(
     pcg32_srandom_r(&rng, (u64)memcpy, (u64)memmove);
     {
         f32x3 *centroid_iter = centroids;
-        f32x3 *color_iter = colors, *colors_end = colors + color_count;
+        f32x3 *color_iter = colors;
         for (isize i = 0; i < centroid_count; i += 1) {
             isize next_color_index = f64_random(&rng) * (colors_end - color_iter);
             assert(next_color_index < colors_end - color_iter);
@@ -1508,39 +1618,9 @@ static inline isize u16_write_le(u16 value, u8 *dest) {
     return 2;
 }
 
-static inline int u32_leading_zeros(u32 value) {
-#if defined(__clang__) || defined(__GNUC__)
-    return __builtin_clz(value);
-#elif defined(_MSC_VER)
-    return (int)__lzcnt(value);
-#else
-    int result = 0;
-    if ((value & 0xffff0000) == 0) {
-        result += 16;
-        value <<= 16;
-    }
-    if ((value & 0xff000000) == 0) {
-        result += 8;
-        value <<= 8;
-    }
-    if ((value & 0xf0000000) == 0) {
-        result += 4;
-        value <<= 4;
-    }
-    if ((value & 0xc0000000) == 0) {
-        result += 2;
-        value <<= 2;
-    }
-    if ((value & 0x80000000) == 0) {
-        result += 1;
-    }
-    return result;
-#endif
-}
-
 static inline int u32_log2_ceil(u32 value) {
     assert(value != 0);
-    return 32 - u32_leading_zeros(value - 1);
+    return 32 - u32_leading_zeroes(value - 1);
 }
 
 static inline bool isize_power_of_two(isize value) {

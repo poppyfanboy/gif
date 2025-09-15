@@ -149,11 +149,17 @@ u8 *oklab_to_srgb(f32 const *oklab_colors, isize color_count, void *arena);
 
 
 // Generate a custom color palette that best fits the given image.
+// Palette generation functions work best when you pass them unique colors.
+
+u8 *colors_unique(u8 const *colors, isize color_count, isize *unique_color_count, void *arena);
+
+// Writes the result directly into the "colors" array. Still needs extra memory for the hash set.
+u8 *colors_unique_inplace(u8 *colors, isize color_count, isize *unique_color_count, void *arena);
 
 f32 *palette_by_median_cut(
-    f32 const *pixels, isize pixel_count,
+    f32 const *colors, isize color_count,
     isize target_color_count,
-    isize *color_count,
+    isize *colors_generated,
     void *arena
 );
 

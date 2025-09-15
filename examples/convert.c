@@ -7,11 +7,10 @@
 //        [-palette-gen (median-cut|k-means)]
 //        [-color-count <generated palette color count>]
 
-#include <stdlib.h>     // malloc, free
+#include <stdlib.h>     // malloc, free, strtoll, abort
 #include <stddef.h>     // size_t, NULL
 #include <stdio.h>      // FILE, fopen, fwrite, fclose, fprintf, stderr
 #include <string.h>     // strcmp
-#include <stdlib.h>     // strtoll
 #include <errno.h>      // errno, ERANGE
 #include <stdbool.h>    // bool, true, false
 #include <setjmp.h>     // jmp_buf, setjmp, longjmp
@@ -54,6 +53,8 @@ f32 *from_srgb(u8 const *srgb_colors, isize color_count, ColorSpace color_space,
     case LAB:       return srgb_to_lab(srgb_colors, color_count, arena);
     case OKLAB:     return srgb_to_oklab(srgb_colors, color_count, arena);
     }
+
+    abort();
 }
 
 u8 *into_srgb(f32 const *colors, isize color_count, ColorSpace color_space, Arena *arena) {
@@ -63,6 +64,8 @@ u8 *into_srgb(f32 const *colors, isize color_count, ColorSpace color_space, Aren
     case LAB:       return lab_to_srgb(colors, color_count, arena);
     case OKLAB:     return oklab_to_srgb(colors, color_count, arena);
     }
+
+    abort();
 }
 
 bool parse_int(char const *string, isize *integer) {
@@ -180,6 +183,9 @@ int main(int arg_count, char **args) {
 
     f32 *pixels;
     int image_width, image_height;
+
+    f32 *unique_pixels;
+    isize unique_pixel_count;
     {
         u8 *srgb_pixels = stbi_load(input_file_name, &image_width, &image_height, NULL, 3);
         if (srgb_pixels == NULL) {
@@ -188,6 +194,13 @@ int main(int arg_count, char **args) {
         }
 
         pixels = from_srgb(srgb_pixels, image_width * image_height, color_space, &arena);
+
+        u8 *unique_srgb_pixels = colors_unique_inplace(
+            srgb_pixels, (isize)image_width * image_height,
+            &unique_pixel_count,
+            &arena
+        );
+        unique_pixels = from_srgb(unique_srgb_pixels, unique_pixel_count, color_space, &arena);
     }
 
     // Pick a color palette.
@@ -209,7 +222,7 @@ int main(int arg_count, char **args) {
         switch (palette_gen) {
         case MEDIAN_CUT: {
             colors = palette_by_median_cut(
-                pixels, image_width * image_height,
+                unique_pixels, unique_pixel_count,
                 max_color_count,
                 &color_count,
                 &arena
@@ -218,7 +231,7 @@ int main(int arg_count, char **args) {
 
         case K_MEANS: {
             colors = palette_by_k_means(
-                pixels, image_width * image_height,
+                unique_pixels, unique_pixel_count,
                 max_color_count,
                 &color_count,
                 &arena
