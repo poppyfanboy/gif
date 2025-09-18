@@ -3,7 +3,6 @@
 // - https://en.wikipedia.org/wiki/GIF
 // - https://web.archive.org/web/20180620143135/https://www.vurdalakov.net/misc/gif/netscape-looping-application-extension
 
-// TODO: Try implementing an improved version of median-cut algorithm from Leptonica (MMCQ).
 // TODO: Transdiff from ffmpeg: unchanged pixels are encoded as transparent on next frame.
 // TODO: Color search: partition space, create list of possible closest colors for each partition.
 // TODO: Color search: sort colors along 3 axis, first check colors which have closer projections.
@@ -811,6 +810,16 @@ static inline isize isize_max(isize left, isize right) {
     return left > right ? left : right;
 }
 
+static inline isize isize_clamp(isize value, isize min, isize max) {
+    if (value < min) {
+        return min;
+    }
+    if (value > max) {
+        return max;
+    }
+    return value;
+}
+
 static inline isize isize_abs(isize value) {
     if (value >= 0) {
         return value;
@@ -846,8 +855,6 @@ f32 *palette_by_median_cut(
     isize *colors_generated,
     void *arena
 ) {
-    assert(target_color_count <= GIF_MAX_COLORS);
-
     f32 *palette = arena_alloc(arena, target_color_count * COMPONENTS_PER_COLOR * sizeof(f32));
     if (palette == NULL) {
         *colors_generated = 0;
@@ -870,16 +877,27 @@ f32 *palette_by_median_cut(
 
     // Ring buffer is used for the queue.
     typedef struct {
+        Segment *segments;
+        isize count;
+        isize capacity;
+
         isize first_index;
         isize last_index;
-        isize count;
-        Segment segments[GIF_MAX_COLORS];
     } SegmentsQueue;
 
-    SegmentsQueue queue;
-    queue.first_index = 0;
-    queue.last_index = 0;
-    queue.count = 1;
+    Segment *queue_segments = arena_alloc(arena, target_color_count * sizeof(Segment));
+    if (queue_segments == NULL) {
+        *colors_generated = 0;
+        return NULL;
+    }
+
+    SegmentsQueue queue = {
+        .segments = queue_segments,
+        .count = 1,
+        .capacity = target_color_count,
+        .first_index = 0,
+        .last_index = 0,
+    };
     queue.segments[queue.first_index] = (Segment){colors, colors + color_count};
 
     while (queue.count < target_color_count) {
@@ -893,7 +911,7 @@ f32 *palette_by_median_cut(
             break;
         }
 
-        queue.first_index = (queue.first_index + 1) % countof(queue.segments);
+        queue.first_index = (queue.first_index + 1) % queue.capacity;
         queue.count -= 1;
 
         f32 min_x = INFINITY, min_y = INFINITY, min_z = INFINITY;
@@ -929,15 +947,15 @@ f32 *palette_by_median_cut(
             comparator
         );
 
-        queue.segments[(queue.last_index + 1) % countof(queue.segments)] = (Segment){
+        queue.segments[(queue.last_index + 1) % queue.capacity] = (Segment){
             .begin = current_segment.begin,
             .end = current_segment.begin + (current_segment.end - current_segment.begin) / 2,
         };
-        queue.segments[(queue.last_index + 2) % countof(queue.segments)] = (Segment){
+        queue.segments[(queue.last_index + 2) % queue.capacity] = (Segment){
             .begin = current_segment.begin + (current_segment.end - current_segment.begin) / 2,
             .end = current_segment.end,
         };
-        queue.last_index = (queue.last_index + 2) % countof(queue.segments);
+        queue.last_index = (queue.last_index + 2) % queue.capacity;
         queue.count += 2;
     }
 
@@ -967,7 +985,7 @@ f32 *palette_by_median_cut(
             break;
         }
         quantized_colors_iter += COMPONENTS_PER_COLOR;
-        segment_index = (segment_index + 1) % countof(queue.segments);
+        segment_index = (segment_index + 1) % queue.capacity;
     }
 
     arena_rewind(arena, snapshot);
@@ -979,11 +997,9 @@ f32 *palette_by_k_means(
     f32 const *colors_raw, isize color_count,
     isize target_color_count,
     isize *colors_generated,
-    void *arena_void
+    void *arena
 ) {
     isize const MAX_ITERATIONS = 300;
-
-    Arena *arena = arena_void;
 
     f32 *palette = arena_alloc(arena, target_color_count * COMPONENTS_PER_COLOR * sizeof(f32));
     if (palette == NULL) {
@@ -1116,6 +1132,373 @@ f32 *palette_by_k_means(
     memcpy(palette, centroids, centroid_count * sizeof(f32x3));
     *colors_generated = centroid_count;
     arena_rewind(arena, snapshot);
+    return palette;
+}
+
+static inline u8 *palette_by_modified_median_cut_impl(
+    u8 const *colors, isize color_count,
+    isize target_color_count,
+    isize *colors_generated,
+    void *arena
+) {
+    int const QUANT = 6;
+
+    ArenaSnapshot snapshot = arena_snapshot(arena);
+
+    u8 *palette = arena_alloc(arena, target_color_count * COMPONENTS_PER_COLOR * sizeof(u8));
+    if (palette == NULL) {
+        return NULL;
+    }
+
+    // Quantize input colors to QUANT bits and count colors within each "quantum volume".
+    // LSB of an index are for the red component, MSB are for the blue component.
+
+    isize quantized_color_count = (isize)(1 << QUANT) * (1 << QUANT) * (1 << QUANT);
+    isize *color_frequencies = arena_alloc(arena, quantized_color_count * sizeof(isize));
+    if (color_frequencies == NULL) {
+        return NULL;
+    }
+
+    memset(color_frequencies, 0, quantized_color_count * sizeof(isize));
+    {
+        u8 const *color_iter = colors;
+        while (color_iter < colors + color_count * COMPONENTS_PER_COLOR) {
+            isize index =
+                (u32)(color_iter[0] >> (8 - QUANT)) << (0 * QUANT) |
+                (u32)(color_iter[1] >> (8 - QUANT)) << (1 * QUANT) |
+                (u32)(color_iter[2] >> (8 - QUANT)) << (2 * QUANT);
+            color_frequencies[index] += 1;
+
+            color_iter += COMPONENTS_PER_COLOR;
+        }
+    }
+
+    // The "min" end of the box is inclusive, the "max" end is exclusive.
+    typedef struct {
+        isize min[3];
+        isize max[3];
+        isize color_count;
+        isize volume;
+    } Box;
+
+    typedef struct {
+        Box *boxes;
+        isize active_count;
+        isize total_count;
+        isize capacity;
+    } BoxQueue;
+
+    // We start with a single box encompassing the whole color space.
+    // Presumably this way the generated palette works better with error diffusion dithering.
+    BoxQueue queue = {
+        .boxes = arena_alloc(arena, target_color_count * sizeof(Box)),
+        .active_count = 1,
+        .total_count = 1,
+        .capacity = target_color_count,
+    };
+    if (queue.boxes == NULL) {
+        return NULL;
+    }
+    queue.boxes[0] = (Box){
+        .min = {0, 0, 0},
+        .max = {1 << QUANT, 1 << QUANT, 1 << QUANT},
+        .color_count = color_count,
+        .volume = (isize)(1 << QUANT) * (1 << QUANT) * (1 << QUANT),
+    };
+
+    isize *box_plane_frequencies = arena_alloc(arena, (1 << QUANT) * sizeof(isize));
+    if (box_plane_frequencies == NULL) {
+        return NULL;
+    }
+
+    // First choose the next box to subdivide based on color count, do the rest of the subdivisions
+    // based on combination of both volume and color count.
+    bool volume_affects_priority = false;
+
+    while (queue.active_count > 0 && queue.total_count < target_color_count) {
+        // Once we've generated 80% of the colors, start counting box volume into account as well.
+        if (
+            !volume_affects_priority &&
+            (target_color_count - queue.total_count) * 5 < target_color_count * 4
+        ) {
+            volume_affects_priority = true;
+
+            // Re-heapify the queue based on the changed priority metric.
+            for (isize i = 1; i < queue.active_count; i += 1) {
+                isize current = i;
+                Box current_box = queue.boxes[current];
+                isize current_priority = current_box.color_count * current_box.volume;
+
+                while (current > 0) {
+                    isize parent = (current - 1) / 2;
+                    isize parent_priority =
+                        queue.boxes[parent].color_count * queue.boxes[parent].volume;
+
+                    if (parent_priority > current_priority) {
+                        break;
+                    }
+                    queue.boxes[current] = queue.boxes[parent];
+                    current = parent;
+                }
+
+                queue.boxes[current] = current_box;
+            }
+        }
+
+        Box next_box = queue.boxes[0];
+
+        // Pick the longest dimension of the box.
+        int this_dimension = 0;
+        if (
+            next_box.max[1] - next_box.min[1] >= next_box.max[0] - next_box.min[0] &&
+            next_box.max[1] - next_box.min[1] >= next_box.max[2] - next_box.min[2]
+        ) {
+            this_dimension = 1;
+        } else if (
+            next_box.max[2] - next_box.min[2] >= next_box.max[0] - next_box.min[0] &&
+            next_box.max[2] - next_box.min[2] >= next_box.max[1] - next_box.min[1]
+        ) {
+            this_dimension = 2;
+        }
+        int other_dimension = (this_dimension + 1) % 3;
+        int another_dimension = (this_dimension + 2) % 3;
+
+        // Find the median point.
+        for (
+            isize this = next_box.min[this_dimension];
+            this < next_box.max[this_dimension];
+            this += 1
+        ) {
+            box_plane_frequencies[this] = 0;
+
+            for (
+                isize other = next_box.min[other_dimension];
+                other < next_box.max[other_dimension];
+                other += 1
+            ) {
+                for (
+                    isize another = next_box.min[another_dimension];
+                    another < next_box.max[another_dimension];
+                    another += 1
+                ) {
+                    isize index =
+                        this    << (this_dimension    * QUANT) |
+                        other   << (other_dimension   * QUANT) |
+                        another << (another_dimension * QUANT);
+
+                    box_plane_frequencies[this] += color_frequencies[index];
+                }
+            }
+        }
+        isize median_index = next_box.min[this_dimension];
+        isize left_box_color_count = 0;
+        while (
+            median_index < next_box.max[this_dimension] &&
+            left_box_color_count <= next_box.color_count / 2
+        ) {
+            left_box_color_count += box_plane_frequencies[median_index];
+            median_index += 1;
+        }
+        {
+            // Put the box at the median point into the smaller half.
+            isize left_half = median_index - next_box.min[this_dimension];
+            isize right_half = next_box.max[this_dimension] - median_index;
+            if (left_half < right_half) {
+                left_box_color_count += box_plane_frequencies[median_index];
+                median_index += 1;
+            }
+        }
+
+        // Move the median partition point further into the less dense partition.
+        isize partition_index;
+        {
+            isize left_half = median_index - next_box.min[this_dimension];
+            isize right_half = next_box.max[this_dimension] - median_index;
+            if (left_half > right_half) {
+                partition_index = isize_clamp(
+                    (next_box.min[this_dimension] + median_index) / 2,
+                    next_box.min[this_dimension] + 1,
+                    next_box.max[this_dimension] - 1
+                );
+                for (isize i = partition_index; i < median_index; i += 1) {
+                    left_box_color_count -= box_plane_frequencies[i];
+                }
+            } else if (left_half < right_half) {
+                partition_index = isize_clamp(
+                    (median_index + next_box.max[this_dimension]) / 2,
+                    next_box.min[this_dimension] + 1,
+                    next_box.max[this_dimension] - 1
+                );
+                for (isize i = median_index; i < partition_index; i += 1) {
+                    left_box_color_count += box_plane_frequencies[i];
+                }
+            } else {
+                partition_index = isize_clamp(
+                    median_index,
+                    next_box.min[this_dimension] + 1,
+                    next_box.max[this_dimension] - 1
+                );
+            }
+        }
+
+        // Split the "next_box" into left and right boxes.
+
+        Box left_box = next_box;
+        left_box.max[this_dimension] = partition_index;
+        left_box.color_count = left_box_color_count;
+        left_box.volume =
+            (left_box.max[0] - left_box.min[0]) *
+            (left_box.max[1] - left_box.min[1]) *
+            (left_box.max[2] - left_box.min[2]);
+
+        Box right_box = next_box;
+        right_box.min[this_dimension] = partition_index;
+        right_box.color_count = next_box.color_count - left_box.color_count;
+        right_box.volume = next_box.volume - left_box.volume;
+
+        // We've reached the quantum volume box.
+        // Can't subdivide it any further, put it away at the very and of the queue buffer.
+        if (next_box.max[this_dimension] - next_box.min[this_dimension] == 1) {
+            queue.boxes[queue.capacity - (queue.total_count - queue.active_count) - 1] = next_box;
+            queue.active_count -= 1;
+            left_box = queue.boxes[queue.active_count];
+            right_box = (Box){0};
+        }
+
+        // Replace the "next_box" with the left box in the queue.
+        if (left_box.max[this_dimension] - left_box.min[this_dimension] > 0) {
+            isize current = 0;
+            isize current_priority = volume_affects_priority
+                ? left_box.color_count * left_box.volume
+                : left_box.color_count;
+
+            while (2 * current + 1 < queue.active_count) {
+                isize left = 2 * current + 1;
+                isize left_priority = volume_affects_priority
+                    ? queue.boxes[left].color_count * queue.boxes[left].volume
+                    : queue.boxes[left].color_count;
+
+                isize right = 2 * current + 2;
+                isize right_priority = -1;
+                if (right < queue.active_count) {
+                    right_priority = volume_affects_priority
+                        ? queue.boxes[right].color_count * queue.boxes[right].volume
+                        : queue.boxes[right].color_count;
+                }
+
+                isize max = current;
+                isize max_priority = current_priority;
+
+                if (left_priority > max_priority) {
+                    max = left;
+                    max_priority = left_priority;
+                }
+                if (right_priority > max_priority) {
+                    max = right;
+                    max_priority = right_priority;
+                }
+
+                if (current == max) {
+                    break;
+                }
+                queue.boxes[current] = queue.boxes[max];
+                current = max;
+            }
+
+            queue.boxes[current] = left_box;
+        }
+
+        // Add the right box to the queue.
+        if (right_box.max[this_dimension] - right_box.min[this_dimension] > 0) {
+            queue.active_count += 1;
+            queue.total_count += 1;
+
+            isize current = queue.active_count - 1;
+            isize current_priority = volume_affects_priority
+                ? right_box.color_count * right_box.volume
+                : right_box.color_count;
+
+            while (current > 0) {
+                isize parent = (current - 1) / 2;
+                isize parent_priority = volume_affects_priority
+                    ? queue.boxes[parent].color_count * queue.boxes[parent].volume
+                    : queue.boxes[parent].color_count;
+
+                if (parent_priority > current_priority) {
+                    break;
+                }
+                queue.boxes[current] = queue.boxes[parent];
+                current = parent;
+            }
+
+            queue.boxes[current] = right_box;
+        }
+    }
+
+    u8 *palette_iter = palette;
+    for (isize i = 0; i < queue.total_count; i += 1) {
+        Box box;
+        if (i < queue.active_count) {
+            box = queue.boxes[i];
+        } else {
+            // Coming back for those quantum volume boxes which we couldn't subdivide any further.
+            box = queue.boxes[queue.capacity - i - 1];
+        }
+
+        f32 average[3] = {0};
+        if (box.color_count > 0) {
+            for (isize i = box.min[0]; i < box.max[0]; i += 1) {
+                for (isize j = box.min[1]; j < box.max[1]; j += 1) {
+                    for (isize k = box.min[2]; k < box.max[2]; k += 1) {
+                        isize index = i | j << QUANT | k << QUANT << QUANT;
+                        average[0] += (i << (8 - QUANT)) / 255.0F * color_frequencies[index];
+                        average[1] += (j << (8 - QUANT)) / 255.0F * color_frequencies[index];
+                        average[2] += (k << (8 - QUANT)) / 255.0F * color_frequencies[index];
+                    }
+                }
+            }
+        }
+
+        if (box.color_count == 0) {
+            palette_iter[0] = ((box.min[0] << (8 - QUANT)) + ((box.max[0] - 1) << (8 - QUANT))) / 2;
+            palette_iter[1] = ((box.min[1] << (8 - QUANT)) + ((box.max[1] - 1) << (8 - QUANT))) / 2;
+            palette_iter[2] = ((box.min[2] << (8 - QUANT)) + ((box.max[2] - 1) << (8 - QUANT))) / 2;
+        } else {
+            palette_iter[0] = average[0] / box.color_count * 255.0F;
+            palette_iter[1] = average[1] / box.color_count * 255.0F;
+            palette_iter[2] = average[2] / box.color_count * 255.0F;
+        }
+
+        palette_iter += COMPONENTS_PER_COLOR;
+    }
+
+    // Tighten the initial palette allocation.
+    arena_rewind(arena, snapshot);
+    palette = arena_alloc(arena, queue.total_count * COMPONENTS_PER_COLOR * sizeof(u8));
+    *colors_generated = queue.total_count;
+
+    return palette;
+}
+
+u8 *palette_by_modified_median_cut(
+    u8 const *colors, isize color_count,
+    isize target_color_count,
+    isize *colors_generated,
+    void *arena
+) {
+    ArenaSnapshot snapshot = arena_snapshot(arena);
+
+    u8 *palette = palette_by_modified_median_cut_impl(
+        colors, color_count,
+        target_color_count,
+        colors_generated,
+        arena
+    );
+
+    if (palette == NULL) {
+        *colors_generated = 0;
+        arena_rewind(arena, snapshot);
+    }
     return palette;
 }
 

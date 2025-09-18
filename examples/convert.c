@@ -4,7 +4,7 @@
 //        [-memory <arena size in MiB>]
 //        [-color-space (srgb|linear|lab|oklab)]
 //        [-palette (web-safe|monochrome|black-white|<file>)]
-//        [-palette-gen (median-cut|k-means)]
+//        [-palette-gen (median-cut|k-means|modified-median-cut)]
 //        [-color-count <generated palette color count>]
 
 #include <stdlib.h>     // malloc, free, strtoll, abort
@@ -85,7 +85,7 @@ int main(int arg_count, char **args) {
 
     ColorSpace color_space = SRGB;
     enum { WEB_SAFE, MONOCHROME, BLACK_WHITE, GENERATE, FROM_FILE } palette = GENERATE;
-    enum { MEDIAN_CUT, K_MEANS } palette_gen = MEDIAN_CUT;
+    enum { MEDIAN_CUT, K_MEANS, MODIFIED_MEDIAN_CUT } palette_gen = MEDIAN_CUT;
     char const *palette_file_name = NULL;
     isize max_color_count = 256;
 
@@ -147,6 +147,8 @@ int main(int arg_count, char **args) {
                 palette_gen = MEDIAN_CUT;
             } else if (strcmp(palette_gen_arg, "k-means") == 0) {
                 palette_gen = K_MEANS;
+            } else if (strcmp(palette_gen_arg, "modified-median-cut") == 0) {
+                palette_gen = MODIFIED_MEDIAN_CUT;
             } else {
                 fprintf(stderr, "Invalid palette generation method: '%s'\n", palette_gen_arg);
                 return 1;
@@ -184,6 +186,7 @@ int main(int arg_count, char **args) {
     f32 *pixels;
     int image_width, image_height;
 
+    u8 *unique_srgb_pixels;
     f32 *unique_pixels;
     isize unique_pixel_count;
     {
@@ -195,7 +198,7 @@ int main(int arg_count, char **args) {
 
         pixels = from_srgb(srgb_pixels, image_width * image_height, color_space, &arena);
 
-        u8 *unique_srgb_pixels = colors_unique_inplace(
+        unique_srgb_pixels = colors_unique_inplace(
             srgb_pixels, (isize)image_width * image_height,
             &unique_pixel_count,
             &arena
@@ -227,6 +230,7 @@ int main(int arg_count, char **args) {
                 &color_count,
                 &arena
             );
+            srgb_colors = into_srgb(colors, color_count, color_space, &arena);
         } break;
 
         case K_MEANS: {
@@ -236,10 +240,19 @@ int main(int arg_count, char **args) {
                 &color_count,
                 &arena
             );
+            srgb_colors = into_srgb(colors, color_count, color_space, &arena);
+        } break;
+
+        case MODIFIED_MEDIAN_CUT: {
+            srgb_colors = palette_by_modified_median_cut(
+                unique_srgb_pixels, unique_pixel_count,
+                max_color_count,
+                &color_count,
+                &arena
+            );
+            colors = from_srgb(srgb_colors, color_count, color_space, &arena);
         } break;
         }
-
-        srgb_colors = into_srgb(colors, color_count, color_space, &arena);
     } else if (palette == FROM_FILE) {
         int palette_width, palette_height;
         srgb_colors = stbi_load(palette_file_name, &palette_width, &palette_height, NULL, 3);

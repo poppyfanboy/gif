@@ -164,7 +164,18 @@ f32 *palette_by_median_cut(
 );
 
 f32 *palette_by_k_means(
-    f32 const *pixels, isize pixel_count,
+    f32 const *colors, isize color_count,
+    isize target_color_count,
+    isize *colors_generated,
+    void *arena
+);
+
+// Modified median-cut algorithm implemented following the description from here:
+//  - http://leptonica.org/color-quantization.html
+//  - http://leptonica.org/papers/mediancut.pdf
+//  - https://tpgit.github.io/Leptonica/colorquant2_8c.html
+u8 *palette_by_modified_median_cut(
+    u8 const *colors, isize color_count,
     isize target_color_count,
     isize *colors_generated,
     void *arena
