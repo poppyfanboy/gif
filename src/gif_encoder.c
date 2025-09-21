@@ -6,7 +6,6 @@
 // TODO: Transdiff from ffmpeg: unchanged pixels are encoded as transparent on next frame.
 // TODO: Color search: partition space, create list of possible closest colors for each partition.
 // TODO: Color search: sort colors along 3 axis, first check colors which have closer projections.
-// TODO: Try using a prefix tree for storing the mapping from color sequences to LZW codes.
 // TODO: Implement dithering? I don't know how it's done (though, random one should be easy).
 // TODO: Pass the number of color components in arguments (1 for monochrome, 3 for RGB, 4 for RGBA).
 // TODO: Try using k-means++ for picking an initial set of centroids in k-means.
@@ -16,7 +15,7 @@
 #include <assert.h> // assert
 #include <stdlib.h> // qsort
 #include <stddef.h> // size_t, NULL
-#include <math.h>   // copysignf, powf, roundf, isnan, nanf, cbrtf, INFINITY
+#include <math.h>   // copysignf, powf, roundf, cbrtf, INFINITY
 #include <string.h> // memmove, memcpy, memset, memcmp
 
 // *Really* minimal PCG32 code / (c) 2014 M.E. O'Neill / pcg-random.org
@@ -56,6 +55,17 @@ static f64 f64_random(pcg32_random_t *rng) {
 
 #define USIZE_BITS ((int)sizeof(usize) * 8)
 
+static inline isize u8_write(u8 value, u8 *dest) {
+    dest[0] = value;
+    return 1;
+}
+
+static inline isize u16_write_le(u16 value, u8 *dest) {
+    dest[0] = (u8)(value & 0xff);
+    dest[1] = (u8)(value >> 8);
+    return 2;
+}
+
 #if defined(__clang__) || defined(__GNUC__)
     #define u32_leading_zeroes __builtin_clz
     #define u64_leading_zeroes __builtin_clzll
@@ -85,6 +95,11 @@ static int u64_leading_zeroes_impl(u64 value) {
     return 64 - leading_zeroes;
 }
 
+static inline int u32_log2_ceil(u32 value) {
+    assert(value != 0);
+    return 32 - u32_leading_zeroes(value - 1);
+}
+
 static inline int usize_leading_zeroes(usize value) {
     if (sizeof(usize) == 8) {
         return u64_leading_zeroes(value);
@@ -92,6 +107,43 @@ static inline int usize_leading_zeroes(usize value) {
         return u32_leading_zeroes(value);
     }
 }
+
+static inline isize isize_min(isize left, isize right) {
+    return left < right ? left : right;
+}
+
+static inline isize isize_max(isize left, isize right) {
+    return left > right ? left : right;
+}
+
+static inline isize isize_clamp(isize value, isize min, isize max) {
+    if (value < min) {
+        return min;
+    }
+    if (value > max) {
+        return max;
+    }
+    return value;
+}
+
+static inline isize isize_abs(isize value) {
+    if (value >= 0) {
+        return value;
+    } else {
+        return -value;
+    }
+}
+
+static inline bool isize_power_of_two(isize value) {
+    assert(value > 0);
+    return (value & (value - 1)) == 0;
+}
+
+typedef struct {
+    f32 x;
+    f32 y;
+    f32 z;
+} f32x3;
 
 #define ARENA_ALIGNMENT 16
 
@@ -154,7 +206,6 @@ static void *arena_alloc(Arena *arena, isize size) {
 }
 
 static void *arena_realloc(Arena *arena, void *old_ptr, isize old_size, isize new_size) {
-    assert(old_ptr != NULL);
     assert(((uptr)old_ptr & (ARENA_ALIGNMENT - 1)) == 0);
 
     if (new_size == 0) {
@@ -162,6 +213,9 @@ static void *arena_realloc(Arena *arena, void *old_ptr, isize old_size, isize ne
     }
     if (old_size >= new_size) {
         return old_ptr;
+    }
+    if (old_ptr == NULL) {
+        return arena_alloc(arena, new_size);
     }
 
     if ((u8 *)old_ptr + old_size == arena->begin) {
@@ -256,9 +310,8 @@ f32 *srgb_to_float(u8 const *srgb_colors, isize color_count, void *arena) {
         return NULL;
     }
 
-    f32 *float_color_iter = float_colors;
-
     u8 const *srgb_color_iter = srgb_colors;
+    f32 *float_color_iter = float_colors;
 
     while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
         float_color_iter[0] = (f32)srgb_color_iter[0] / 255.0F;
@@ -278,9 +331,8 @@ u8 *float_to_srgb(f32 const *float_colors, isize color_count, void *arena) {
         return NULL;
     }
 
-    u8 *srgb_color_iter = srgb_colors;
-
     f32 const *float_color_iter = float_colors;
+    u8 *srgb_color_iter = srgb_colors;
 
     while (float_color_iter != float_colors + color_count * COMPONENTS_PER_COLOR) {
         srgb_color_iter[0] = (u8)(float_color_iter[0] * 255.0F);
@@ -305,9 +357,8 @@ f32 *srgb_to_linear(u8 const *srgb_colors, isize color_count, void *arena) {
         return NULL;
     }
 
-    f32 *linear_color_iter = linear_colors;
-
     u8 const *srgb_color_iter = srgb_colors;
+    f32 *linear_color_iter = linear_colors;
 
     while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
         linear_color_iter[0] = srgb_component_to_linear((f32)srgb_color_iter[0] / 255.0F);
@@ -332,27 +383,20 @@ u8 *linear_to_srgb(f32 const *linear_colors, isize color_count, void *arena) {
         return NULL;
     }
 
-    u8 *srgb_color_iter = srgb_colors;
-
     f32 const *linear_color_iter = linear_colors;
+    u8 *srgb_color_iter = srgb_colors;
 
     while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
         srgb_color_iter[0] = (u8)(linear_component_to_srgb(linear_color_iter[0]) * 255.0F);
         srgb_color_iter[1] = (u8)(linear_component_to_srgb(linear_color_iter[1]) * 255.0F);
         srgb_color_iter[2] = (u8)(linear_component_to_srgb(linear_color_iter[2]) * 255.0F);
 
-        srgb_color_iter += COMPONENTS_PER_COLOR;
         linear_color_iter += COMPONENTS_PER_COLOR;
+        srgb_color_iter += COMPONENTS_PER_COLOR;
     }
 
     return srgb_colors;
 }
-
-typedef struct {
-    f32 x;
-    f32 y;
-    f32 z;
-} f32x3;
 
 f32 *srgb_to_lab(u8 const *srgb_colors, isize color_count, void *arena) {
     f32 *lab_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(f32));
@@ -360,9 +404,8 @@ f32 *srgb_to_lab(u8 const *srgb_colors, isize color_count, void *arena) {
         return NULL;
     }
 
-    f32 *lab_color_iter = lab_colors;
-
     u8 const *srgb_color_iter = srgb_colors;
+    f32 *lab_color_iter = lab_colors;
 
     while (srgb_color_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
         f32x3 linear_srgb = {
@@ -426,9 +469,8 @@ u8 *lab_to_srgb(f32 const *lab_colors, isize color_count, void *arena) {
         return NULL;
     }
 
-    u8 *srgb_color_iter = srgb_colors;
-
     f32 const *lab_color_iter = lab_colors;
+    u8 *srgb_color_iter = srgb_colors;
 
     while (lab_color_iter != lab_colors + color_count * COMPONENTS_PER_COLOR) {
         // Standard Illuminant D65
@@ -485,9 +527,8 @@ f32 *srgb_to_oklab(u8 const *srgb_colors, isize color_count, void *arena) {
         return NULL;
     }
 
-    f32 *oklab_iter = oklab_colors;
-
     u8 const *srgb_iter = srgb_colors;
+    f32 *oklab_iter = oklab_colors;
 
     while (srgb_iter != srgb_colors + color_count * COMPONENTS_PER_COLOR) {
         f32x3 linear = {
@@ -518,16 +559,14 @@ f32 *srgb_to_oklab(u8 const *srgb_colors, isize color_count, void *arena) {
     return oklab_colors;
 }
 
-// See srgb_to_oklab for the references.
 u8 *oklab_to_srgb(f32 const *oklab_colors, isize color_count, void *arena) {
     u8 *srgb_colors = arena_alloc(arena, color_count * COMPONENTS_PER_COLOR * sizeof(u8));
     if (srgb_colors == NULL) {
         return NULL;
     }
 
-    u8 *srgb_iter = srgb_colors;
-
     f32 const *oklab_iter = oklab_colors;
+    u8 *srgb_iter = srgb_colors;
 
     while (oklab_iter != oklab_colors + color_count * COMPONENTS_PER_COLOR) {
         int const L = 0, a = 1, b = 2;
@@ -802,51 +841,16 @@ u8 *colors_unique_inplace(u8 *colors, isize color_count, isize *unique_color_cou
     return color_set.colors[0];
 }
 
-static inline isize isize_min(isize left, isize right) {
-    return left < right ? left : right;
+static int f32x3_compare_by_x(void const *left, void const *right) {
+    return (int)copysignf(1.0F, ((f32x3 *)left)->x - ((f32x3 *)right)->x);
 }
 
-static inline isize isize_max(isize left, isize right) {
-    return left > right ? left : right;
+static int f32x3_compare_by_y(void const *left, void const *right) {
+    return (int)copysignf(1.0F, ((f32x3 *)left)->y - ((f32x3 *)right)->y);
 }
 
-static inline isize isize_clamp(isize value, isize min, isize max) {
-    if (value < min) {
-        return min;
-    }
-    if (value > max) {
-        return max;
-    }
-    return value;
-}
-
-static inline isize isize_abs(isize value) {
-    if (value >= 0) {
-        return value;
-    } else {
-        return -value;
-    }
-}
-
-static int f32x3_compare_x_only(void const *left_ptr, void const *right_ptr) {
-    f32x3 left = *(f32x3 *)left_ptr;
-    f32x3 right = *(f32x3 *)right_ptr;
-
-    return (int)copysignf(1.0F, left.x - right.x);
-}
-
-static int f32x3_compare_y_only(void const *left_ptr, void const *right_ptr) {
-    f32x3 left = *(f32x3 *)left_ptr;
-    f32x3 right = *(f32x3 *)right_ptr;
-
-    return (int)copysignf(1.0F, left.y - right.y);
-}
-
-static int f32x3_compare_z_only(void const *left_ptr, void const *right_ptr) {
-    f32x3 left = *(f32x3 *)left_ptr;
-    f32x3 right = *(f32x3 *)right_ptr;
-
-    return (int)copysignf(1.0F, left.z - right.z);
+static int f32x3_compare_by_z(void const *left, void const *right) {
+    return (int)copysignf(1.0F, ((f32x3 *)left)->z - ((f32x3 *)right)->z);
 }
 
 f32 *palette_by_median_cut(
@@ -855,13 +859,13 @@ f32 *palette_by_median_cut(
     isize *colors_generated,
     void *arena
 ) {
+    ArenaSnapshot snapshot = arena_snapshot(arena);
+
     f32 *palette = arena_alloc(arena, target_color_count * COMPONENTS_PER_COLOR * sizeof(f32));
     if (palette == NULL) {
         *colors_generated = 0;
         return NULL;
     }
-
-    ArenaSnapshot snapshot = arena_snapshot(arena);
 
     f32x3 *colors = arena_alloc(arena, color_count * sizeof(f32x3));
     if (colors == NULL) {
@@ -934,11 +938,11 @@ f32 *palette_by_median_cut(
 
         int(*comparator)(void const *, void const *);
         if (max_x - min_x >= max_y - min_y && max_x - min_x >= max_z - min_z) {
-            comparator = f32x3_compare_x_only;
+            comparator = f32x3_compare_by_x;
         } else if (max_y - min_y >= max_x - min_x && max_y - min_y >= max_z - min_z) {
-            comparator = f32x3_compare_y_only;
+            comparator = f32x3_compare_by_y;
         } else {
-            comparator = f32x3_compare_z_only;
+            comparator = f32x3_compare_by_z;
         }
         qsort(
             current_segment.begin,
@@ -959,7 +963,7 @@ f32 *palette_by_median_cut(
         queue.count += 2;
     }
 
-    f32 *quantized_colors_iter = palette;
+    f32 *palette_iter = palette;
     isize segment_index = queue.first_index;
 
     while (true) {
@@ -977,19 +981,22 @@ f32 *palette_by_median_cut(
         }
 
         isize color_count = queue.segments[segment_index].end - queue.segments[segment_index].begin;
-        quantized_colors_iter[0] = (f32)(x_sum / (f64)color_count);
-        quantized_colors_iter[1] = (f32)(y_sum / (f64)color_count);
-        quantized_colors_iter[2] = (f32)(z_sum / (f64)color_count);
+        palette_iter[0] = (f32)(x_sum / (f64)color_count);
+        palette_iter[1] = (f32)(y_sum / (f64)color_count);
+        palette_iter[2] = (f32)(z_sum / (f64)color_count);
 
         if (segment_index == queue.last_index) {
             break;
         }
-        quantized_colors_iter += COMPONENTS_PER_COLOR;
+        palette_iter += COMPONENTS_PER_COLOR;
         segment_index = (segment_index + 1) % queue.capacity;
     }
 
+    // Tighten the initial palette allocation.
     arena_rewind(arena, snapshot);
+    palette = arena_alloc(arena, queue.count * COMPONENTS_PER_COLOR * sizeof(f32));
     *colors_generated = queue.count;
+
     return palette;
 }
 
@@ -1001,6 +1008,8 @@ f32 *palette_by_k_means(
 ) {
     isize const MAX_ITERATIONS = 300;
 
+    ArenaSnapshot snapshot = arena_snapshot(arena);
+
     f32 *palette = arena_alloc(arena, target_color_count * COMPONENTS_PER_COLOR * sizeof(f32));
     if (palette == NULL) {
         *colors_generated = 0;
@@ -1009,8 +1018,6 @@ f32 *palette_by_k_means(
 
     f32x3 *colors = (f32x3 *)colors_raw;
     f32x3 *colors_end = colors + color_count;
-
-    ArenaSnapshot snapshot = arena_snapshot(arena);
 
     // In total the whole image contained less colors than we asked for.
     if (color_count <= target_color_count) {
@@ -1129,9 +1136,12 @@ f32 *palette_by_k_means(
         new_centroids = swap;
     }
 
+    // Tighten the initial palette allocation.
+    arena_rewind(arena, snapshot);
+    palette = arena_alloc(arena, centroid_count * COMPONENTS_PER_COLOR * sizeof(f32));
     memcpy(palette, centroids, centroid_count * sizeof(f32x3));
     *colors_generated = centroid_count;
-    arena_rewind(arena, snapshot);
+
     return palette;
 }
 
@@ -1445,15 +1455,15 @@ static inline u8 *palette_by_modified_median_cut_impl(
             box = queue.boxes[queue.capacity - i - 1];
         }
 
-        f32 average[3] = {0};
+        f64 sum[3] = {0};
         if (box.color_count > 0) {
             for (isize i = box.min[0]; i < box.max[0]; i += 1) {
                 for (isize j = box.min[1]; j < box.max[1]; j += 1) {
                     for (isize k = box.min[2]; k < box.max[2]; k += 1) {
                         isize index = i | j << QUANT | k << QUANT << QUANT;
-                        average[0] += (i << (8 - QUANT)) / 255.0F * color_frequencies[index];
-                        average[1] += (j << (8 - QUANT)) / 255.0F * color_frequencies[index];
-                        average[2] += (k << (8 - QUANT)) / 255.0F * color_frequencies[index];
+                        sum[0] += (i << (8 - QUANT)) / 255.0F * color_frequencies[index];
+                        sum[1] += (j << (8 - QUANT)) / 255.0F * color_frequencies[index];
+                        sum[2] += (k << (8 - QUANT)) / 255.0F * color_frequencies[index];
                     }
                 }
             }
@@ -1464,9 +1474,9 @@ static inline u8 *palette_by_modified_median_cut_impl(
             palette_iter[1] = ((box.min[1] << (8 - QUANT)) + ((box.max[1] - 1) << (8 - QUANT))) / 2;
             palette_iter[2] = ((box.min[2] << (8 - QUANT)) + ((box.max[2] - 1) << (8 - QUANT))) / 2;
         } else {
-            palette_iter[0] = average[0] / box.color_count * 255.0F;
-            palette_iter[1] = average[1] / box.color_count * 255.0F;
-            palette_iter[2] = average[2] / box.color_count * 255.0F;
+            palette_iter[0] = sum[0] / box.color_count * 255.0F;
+            palette_iter[1] = sum[1] / box.color_count * 255.0F;
+            palette_iter[2] = sum[2] / box.color_count * 255.0F;
         }
 
         palette_iter += COMPONENTS_PER_COLOR;
@@ -1770,118 +1780,24 @@ void gif_out_buffer_reset(GifOutputBuffer *out_buffer) {
     memset(free_memory_begin, 0, (size_t)(free_memory_end - free_memory_begin));
 }
 
-typedef struct {
-    GifColorIndex *indices;
-    isize count;
-} ColorSequence;
-
-typedef struct {
-    GifColorIndex *data;
-    isize size;
-    isize capacity;
-} ColorSequenceArena;
-
-static GifColorIndex *color_sequence_alloc(ColorSequenceArena *arena, isize size) {
-    assert(arena->size + size < arena->capacity);
-
-    GifColorIndex *indices = arena->data + arena->size;
-    arena->size += size;
-    return indices;
-}
-
-// Based on djb2 hashing function:
-// http://www.cse.yorku.ca/~oz/hash.html
-static u32 color_sequence_hash(ColorSequence sequence) {
-    u32 hash = 5381;
-
-    GifColorIndex *sequence_iter = sequence.indices;
-    while (sequence_iter < sequence.indices + sequence.count) {
-        hash = ((hash << 5) + hash) + *sequence_iter;
-
-        sequence_iter += 1;
-    }
-
-    return hash;
-}
-
-static bool color_sequence_equals(ColorSequence left, ColorSequence right) {
-    assert(left.count != 0 || right.count != 0);
-
-    if (left.count != right.count) {
-        return false;
-    }
-
-    return memcmp(left.indices, right.indices, (size_t)(left.count * sizeof(GifColorIndex))) == 0;
-}
-
-typedef struct {
-    GifColorIndex *indices;
-    isize count;
-    isize capacity;
-} ColorArray;
-
-void color_array_push(ColorArray *colors, GifColorIndex index) {
-    assert(colors->count < colors->capacity);
-
-    colors->indices[colors->count] = index;
-    colors->count += 1;
-}
-
 typedef isize LzwCode;
-#define MAX_LZW_CODE 4095
+#define LZW_CODE_INVALID ((LzwCode)(-1))
+#define MAX_LZW_CODE ((LzwCode)4095)
 #define LZW_CODE_MAX_BIT_LENGTH 12
 
-// Key = ColorSequence
-// Value = LzwCode
-// An empty color sequence indicates an empty bucket.
-typedef struct {
-    ColorSequence sequence;
-    LzwCode code;
-} LzwTableBucket;
+typedef struct LzwTreeNode LzwTreeNode;
 
-typedef struct {
-    LzwTableBucket *buckets;
-    isize sequence_count;
-    isize bucket_count;
-} LzwTable;
+// A prefix tree for storing the "Color Sequence -> LZW Code" mappings.
+// The first tree level (the root node itself) is for storing LZW codes for sequences of length one.
+// LZW_CODE_INVALID is used to indicate an empty link.
+// "(lzw_codes[i] == LZW_CODE_INVALID) => (children[i] == NULL)" is an invariant.
+struct LzwTreeNode {
+    LzwCode lzw_codes[GIF_MAX_COLORS];
+    LzwTreeNode *children[GIF_MAX_COLORS];
 
-static void lzw_table_insert(LzwTable *lzw_table, ColorSequence new_sequence, LzwCode new_code) {
-    assert(new_sequence.count > 0);
-    assert(lzw_table->sequence_count < lzw_table->bucket_count);
-
-    isize bucket_index = color_sequence_hash(new_sequence) % lzw_table->bucket_count;
-    while (lzw_table->buckets[bucket_index].sequence.count > 0) {
-        assert(!color_sequence_equals(new_sequence, lzw_table->buckets[bucket_index].sequence));
-
-        bucket_index = (bucket_index + 1) % lzw_table->bucket_count;
-    }
-
-    lzw_table->buckets[bucket_index].sequence = new_sequence;
-    lzw_table->buckets[bucket_index].code = new_code;
-
-    lzw_table->sequence_count += 1;
-}
-
-static bool lzw_table_get_code(
-    LzwTable const *lzw_table,
-    ColorSequence needle_sequence,
-    LzwCode *code
-) {
-    isize bucket_index = color_sequence_hash(needle_sequence) % lzw_table->bucket_count;
-    while (
-        lzw_table->buckets[bucket_index].sequence.count > 0 &&
-        !color_sequence_equals(needle_sequence, lzw_table->buckets[bucket_index].sequence)
-    ) {
-        bucket_index = (bucket_index + 1) % lzw_table->bucket_count;
-    }
-
-    if (lzw_table->buckets[bucket_index].sequence.count > 0) {
-        *code = lzw_table->buckets[bucket_index].code;
-        return true;
-    } else {
-        return false;
-    }
-}
+    // Used for collecting tree nodes into "free" and "used" lists. (See "free_lzw_nodes" below.)
+    LzwTreeNode *next;
+};
 
 typedef enum {
     GIF_ENCODER_IDLE,
@@ -1891,6 +1807,7 @@ typedef enum {
 
 struct GifEncoder {
     GifEncoderState state;
+    Arena *arena;
 
     isize width;
     isize height;
@@ -1916,99 +1833,61 @@ struct GifEncoder {
     // because LzwCode is literally an alias for isize, but still.
     isize next_available_lzw_code;
 
-    ColorSequenceArena color_sequence_arena;
-    LzwTable lzw_table;
-    ColorArray current_sequence;
+    struct {
+        LzwTreeNode *root;
+        LzwTreeNode *iter;
+
+        // Last node added into the tree. The root is always the first one.
+        LzwTreeNode *last;
+    } lzw_tree;
+    LzwCode next_lzw_code;
+
+    // Nodes recycled after resetting the LZW tree.
+    LzwTreeNode *free_lzw_nodes;
 };
 
-static void gif_encoder_init(GifEncoder *encoder, Arena *arena) {
+static bool gif_encoder_init(GifEncoder *encoder, Arena *arena) {
     encoder->state = GIF_ENCODER_IDLE;
+    encoder->arena = arena;
     encoder->global_color_count = 0;
     encoder->local_color_count = 0;
 
-    // Memory for the color sequences
-    // Worst case scenario: large single-color image with a palette of size 2.
-    //
-    // Initially LZW table is filled with 2 sequences of length 1. Then we have a range of [4..4096)
-    // LZW codes available to be associated with color sequences. While encoding a single-color
-    // image we will use longer and longer sequences of the same color (starting from a sequence of
-    // size 2) until we reach the maximum LZW code.
-    //
-    // So, in total we will need:
-    // 1 + 1 + 2 + 3 + ... + 4093 = 1 + 1 + (2 + 4093) * 4092 / 2 = 8378372 bytes ~ 8 MiB
-    //         \________________/
-    //           4092 sequences
+    LzwTreeNode *root = arena_alloc(arena, sizeof(LzwTreeNode));
+    if (root == NULL) {
+        return false;
+    }
+    memset(root->children, 0, sizeof(root->children));
 
-    // Minus 2 for the sequences of length 1.
-    // Minus 2 for the clear and end codes.
-    isize max_sequence_size = 1 + ((MAX_LZW_CODE + 1) - 4);
-    isize total_color_count = 1 + 1 + (2 + max_sequence_size) * (max_sequence_size - 2 + 1) / 2;
-    u8 *sequence_memory = arena_alloc(arena, total_color_count * sizeof(GifColorIndex));
-    encoder->color_sequence_arena.data = sequence_memory;
-    encoder->color_sequence_arena.size = 0;
-    encoder->color_sequence_arena.capacity = total_color_count;
+    // Initially fill the tree with every single color sequence of length one.
+    for (isize index = 0; index < countof(root->lzw_codes); index += 1) {
+        root->lzw_codes[index] = index;
+    }
 
-    // We will need at most 4096 buckets (24 bytes per bucket), allocate twice this amount:
-    // 24 * 4096 * 2 = 196608 bytes = 192 KiB
-    isize lzw_bucket_count = 2 * (MAX_LZW_CODE + 1);
-    encoder->lzw_table.buckets = arena_alloc(arena, lzw_bucket_count * sizeof(LzwTableBucket));
-    encoder->lzw_table.sequence_count = 0;
-    encoder->lzw_table.bucket_count = lzw_bucket_count;
+    encoder->free_lzw_nodes = NULL;
+    encoder->lzw_tree.root = root;
+    encoder->lzw_tree.last = root;
 
-    // Additionally 4093 bytes for the max sequence of the currently accumulated image colors.
-    encoder->current_sequence.indices = arena_alloc(arena, max_sequence_size);
-    encoder->current_sequence.count = 0;
-    encoder->current_sequence.capacity = max_sequence_size;
-}
+    // This means that we haven't started matching any color sequence from the LZW tree yet.
+    encoder->lzw_tree.iter = root;
+    encoder->next_lzw_code = LZW_CODE_INVALID;
 
-isize gif_encoder_required_memory(void) {
-    uptr const UPTR_MAX = ~(uptr)0;
-    Arena fake_arena = {
-        .begin = 0,
-        .end = (u8 *)UPTR_MAX,
-    };
-
-    GifEncoder encoder = {0};
-    arena_alloc(&fake_arena, sizeof(GifEncoder));
-    gif_encoder_init(&encoder, &fake_arena);
-
-    return (isize)fake_arena.begin;
+    return true;
 }
 
 GifEncoder *gif_encoder_create(void *arena) {
-    isize required_memory = gif_encoder_required_memory();
-    if (arena_memory_left(arena) < required_memory) {
+    GifEncoder *encoder = arena_alloc(arena, sizeof(GifEncoder));
+    if (encoder == NULL) {
         return NULL;
     }
 
-    GifEncoder *encoder = arena_alloc(arena, sizeof(GifEncoder));
-    gif_encoder_init(encoder, arena);
+    if (!gif_encoder_init(encoder, arena)) {
+        return NULL;
+    }
 
     // Amounts to a delay of 1 second.
     encoder->frame_delay = 100;
 
     return encoder;
-}
-
-static inline isize u8_write(u8 value, u8 *dest) {
-    dest[0] = value;
-    return 1;
-}
-
-static inline isize u16_write_le(u16 value, u8 *dest) {
-    dest[0] = (u8)(value & 0xff);
-    dest[1] = (u8)(value >> 8);
-    return 2;
-}
-
-static inline int u32_log2_ceil(u32 value) {
-    assert(value != 0);
-    return 32 - u32_leading_zeroes(value - 1);
-}
-
-static inline bool isize_power_of_two(isize value) {
-    assert(value > 0);
-    return (value & (value - 1)) == 0;
 }
 
 // GIF color tables can only have sizes which are powers of two >= 2.
@@ -2218,29 +2097,6 @@ static void gif_encoder_write_lzw_code(
     }
 }
 
-static void gif_encoder_reset_lzw_table(GifEncoder *encoder) {
-    encoder->color_sequence_arena.size = 0;
-    encoder->lzw_table.sequence_count = 0;
-    memset(
-        encoder->lzw_table.buckets,
-        0,
-        (size_t)(encoder->lzw_table.bucket_count * sizeof(LzwTableBucket))
-    );
-    for (
-        isize color_index = 0;
-        color_index < (1 << encoder->lzw_code_min_bit_length);
-        color_index += 1
-    ) {
-        ColorSequence single_color_sequence = {
-            .count = 1,
-            .indices = color_sequence_alloc(&encoder->color_sequence_arena, 1),
-        };
-        single_color_sequence.indices[0] = (GifColorIndex)color_index;
-
-        lzw_table_insert(&encoder->lzw_table, single_color_sequence, color_index);
-    }
-}
-
 void gif_encoder_start_frame(
     GifEncoder *encoder,
     u8 const *local_colors,
@@ -2364,10 +2220,6 @@ void gif_encoder_start_frame(
     out_buffer->byte_pos = out_iter - out_buffer->data;
     encoder->data_block_begin = 0;
 
-    encoder->current_sequence.count = 0;
-
-    gif_encoder_reset_lzw_table(encoder);
-
     // Output a clear code because the spec says so:
     // > encoders should output a clear code as the first code of each image data stream.
 
@@ -2402,16 +2254,6 @@ isize gif_encoder_feed_frame(
     GifColorIndex const *pixel_iter = pixels;
     GifColorIndex const *pixels_end = pixels + pixel_count;
 
-    // This should only happen once, right after the frame has been started.
-    //
-    // Cannot do this inside of gif_encoder_start_frame, because at that point the image pixels are
-    // not available yet.
-    if (encoder->current_sequence.count == 0) {
-        assert(*pixel_iter < color_count);
-        color_array_push(&encoder->current_sequence, *pixel_iter);
-        pixel_iter += 1;
-    }
-
     while (pixel_iter < pixels_end) {
         // Make sure that we will be able to exit this function without a buffer overflow.
         //
@@ -2431,60 +2273,49 @@ isize gif_encoder_feed_frame(
             break;
         }
 
-        // It should get initialized on the first iteration of the loop, because the LZW table
-        // contains every color sequence of length 1.
-        LzwCode next_lzw_code;
-        bool new_sequence_found = !lzw_table_get_code(
-            &encoder->lzw_table,
-            (ColorSequence){encoder->current_sequence.indices, encoder->current_sequence.count},
-            &next_lzw_code
-        );
-        // 1st case: This is the first call to the gif_encoder_feed_frame and we explicitly
-        // initialized current_sequence to the first image pixel. Sequences of size 1 are guaranteed
-        // to exist in the LZW table.
-        //
-        // 2nd case: These are pixels left unencoded after the last call to the
-        // gif_encoder_feed_frame, which means that they are guaranteed to exist in the LZW table
-        // (otherwise we would have had put them into the table).
-        assert(!new_sequence_found);
-
         // Accumulate pixels from the image until we find a sequence which is not yet in the table.
-        do {
+        bool new_sequence_found;
+        while (pixel_iter < pixels_end) {
             assert(*pixel_iter < color_count);
-            color_array_push(&encoder->current_sequence, *pixel_iter);
-            pixel_iter += 1;
 
-            new_sequence_found = !lzw_table_get_code(
-                &encoder->lzw_table,
-                (ColorSequence){encoder->current_sequence.indices, encoder->current_sequence.count},
-                &next_lzw_code
-            );
-        } while (pixel_iter < pixels_end && !new_sequence_found);
+            new_sequence_found = encoder->lzw_tree.iter->lzw_codes[*pixel_iter] < 0;
+            if (new_sequence_found) {
+                // Don't consume the pixel which made our sequence "new".
+                // On the next iteration the next accumulated sequence will start with this pixel.
+                break;
+            }
+
+            if (encoder->lzw_tree.iter->children[*pixel_iter] == NULL) {
+                LzwTreeNode *new_node;
+                if (encoder->free_lzw_nodes != NULL) {
+                    new_node = encoder->free_lzw_nodes;
+                    encoder->free_lzw_nodes = encoder->free_lzw_nodes->next;
+                } else {
+                    new_node = arena_alloc(encoder->arena, sizeof(LzwTreeNode));
+                    if (new_node == NULL) {
+                        return -1;
+                    }
+                }
+                encoder->lzw_tree.last->next = new_node;
+                encoder->lzw_tree.last = new_node;
+                memset(new_node->children, 0, sizeof(new_node->children));
+                memset(new_node->lzw_codes, -1, sizeof(new_node->lzw_codes));
+
+                encoder->lzw_tree.iter->children[*pixel_iter] = new_node;
+            }
+
+            encoder->next_lzw_code = encoder->lzw_tree.iter->lzw_codes[*pixel_iter];
+            encoder->lzw_tree.iter = encoder->lzw_tree.iter->children[*pixel_iter];
+
+            pixel_iter += 1;
+        }
 
         if (new_sequence_found) {
             gif_encoder_write_lzw_code(
                 encoder,
-                next_lzw_code,
+                encoder->next_lzw_code,
                 encoder->lzw_code_bit_length,
                 out_buffer
-            );
-
-            // All possible sequences of length 1 are guaranteed to already exist in the table.
-            assert(encoder->current_sequence.count >= 2);
-            assert(encoder->next_available_lzw_code <= MAX_LZW_CODE);
-
-            GifColorIndex *new_sequence_indices = color_sequence_alloc(
-                &encoder->color_sequence_arena,
-                encoder->current_sequence.count
-            );
-            ColorSequence new_sequence = {
-                .count = encoder->current_sequence.count,
-                .indices = new_sequence_indices,
-            };
-            memmove(
-                new_sequence.indices,
-                encoder->current_sequence.indices,
-                (size_t)(encoder->current_sequence.count * sizeof(GifColorIndex))
             );
 
             // Increase the LZW code length here because the spec says so:
@@ -2495,20 +2326,10 @@ isize gif_encoder_feed_frame(
             if (isize_power_of_two(encoder->next_available_lzw_code)) {
                 encoder->lzw_code_bit_length += 1;
             }
-
-            lzw_table_insert(
-                &encoder->lzw_table,
-                new_sequence,
-                encoder->next_available_lzw_code
-            );
+            encoder->lzw_tree.iter->lzw_codes[*pixel_iter] = encoder->next_available_lzw_code;
             encoder->next_available_lzw_code += 1;
 
-            GifColorIndex next_after_existing =
-                encoder->current_sequence.indices[encoder->current_sequence.count - 1];
-            encoder->current_sequence.count = 1;
-            encoder->current_sequence.indices[0] = next_after_existing;
-
-            // When the table is full, the encoder can chose to use the table as is, making no
+            // When the table is full, the encoder can choose to use the table as is, making no
             // changes to it until the encoder chooses to clear it. The encoder during this time
             // sends out codes that are of the maximum Code Size.
             //
@@ -2522,11 +2343,26 @@ isize gif_encoder_feed_frame(
                     out_buffer
                 );
 
-                // Dealloc color sequences and empty the LZW table
-                gif_encoder_reset_lzw_table(encoder);
+                // Empty the LZW tree.
+
+                LzwTreeNode *root = encoder->lzw_tree.root;
+                memset(root->children, 0, sizeof(root->children));
+
+                if (root != encoder->lzw_tree.last) {
+                    encoder->lzw_tree.last->next = encoder->free_lzw_nodes;
+                    encoder->lzw_tree.last = root;
+
+                    encoder->free_lzw_nodes = root->next;
+                    root->next = NULL;
+                }
+
                 encoder->lzw_code_bit_length = encoder->starting_lzw_code_bit_length;
                 encoder->next_available_lzw_code = encoder->starting_lzw_code;
             }
+
+            // Restart matching color sequences from the root of the tree.
+            encoder->lzw_tree.iter = encoder->lzw_tree.root;
+            encoder->next_lzw_code = LZW_CODE_INVALID;
         }
     }
 
@@ -2538,21 +2374,13 @@ void gif_encoder_finish_frame(GifEncoder *encoder, GifOutputBuffer *out_buffer) 
     assert(gif_out_buffer_capacity_left(out_buffer) >= GIF_OUT_BUFFER_MIN_CAPACITY);
 
     // Encode the leftover sequence.
-    if (encoder->current_sequence.count > 0) {
-        LzwCode last_lzw_code;
-        bool last_sequence_exists = lzw_table_get_code(
-            &encoder->lzw_table,
-            (ColorSequence){encoder->current_sequence.indices, encoder->current_sequence.count},
-            &last_lzw_code
-        );
-        assert(last_sequence_exists);
+    if (encoder->lzw_tree.iter != encoder->lzw_tree.root) {
         gif_encoder_write_lzw_code(
             encoder,
-            last_lzw_code,
+            encoder->next_lzw_code,
             encoder->lzw_code_bit_length,
             out_buffer
         );
-        encoder->current_sequence.count = 0;
     }
 
     gif_encoder_write_lzw_code(
@@ -2604,12 +2432,18 @@ bool gif_encode_whole_frame(
             *out_buffer = out_buffer_rewind;
             return false;
         }
-        pixel_iter += gif_encoder_feed_frame(
+
+        isize pixels_consumed = gif_encoder_feed_frame(
             encoder,
             pixel_iter,
             pixels_end - pixel_iter,
             out_buffer
         );
+        if (pixels_consumed >= 0) {
+            pixel_iter += pixels_consumed;
+        } else {
+            return false;
+        }
     }
 
     if (gif_out_buffer_capacity_left(out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {

@@ -1,25 +1,21 @@
 // Conventions and assumptions:
 //  - Color arrays are assumed to have 3 components per pixel: red, green, blue (in this order).
 //  - Functions which create or allocate something will return NULL if you run out of memory.
-//  - Call encoder functions only when you have enough memory (see GIF_OUT_BUFFER_MIN_CAPACITY).
+//  - Use encoder functions only when there is enough free memory left in the output buffer
+//  (see GIF_OUT_BUFFER_MIN_CAPACITY).
 //
 // Customizing allocation:
 //  You can provide a custom hook which is called right before allocating memory from the arena.
-//  Provide the function name at compile time with the GIF_LIB_REPORT_ALLOC define.
+//  Provide the function name at compile time with the GIF_LIB_REPORT_ALLOC #define.
 //  Hook signature: void report_alloc(void *arena, isize size)
+//
+// An output buffer exists outside of the encoder. This way the user can decide, if they want to use
+// a dynamically growing buffer and gradually get the whole GIF into memory, or if they want to use
+// a fixed buffer and flush it into the file every time it gets full.
 //
 // https://nullprogram.com/blog/2023/09/27
 // I liked this guy's idea of using arenas in the library interface as opposed to abstracting
 // allocation behind an ad hoc VMT malloc/realloc/free interface, and decided to try it out myself.
-//
-// I think that arena allocations should be made as explicit as possible, and because of that:
-//
-//  - Output buffer has to exist outside of the encoder. This way the user can decide, if they want
-//    to use a dynamically growing buffer and gradually get the whole GIF into memory, or if they
-//    want to use a fixed buffer and flush it into the file every time it gets full.
-//
-//  - Encoder should not hold onto the pointer to the arena, it needs to preallocate whatever memory
-//    it will need for the internal bookkeeping in advance.
 //
 // An arena itself is just a pair of pointers: struct { u8 *begin; u8 *end; }
 // No arena typedef is provided in this header, so that you could define it yourself and use it not
@@ -50,7 +46,7 @@
 #endif
 
 
-// Every time you use encoder you need to have at least this amount of memory available in buffer.
+// Every time you use encoder you need to have at least this amount of free memory left in buffer.
 #define GIF_OUT_BUFFER_MIN_CAPACITY 1024
 
 typedef struct {
@@ -75,10 +71,6 @@ bool gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, void *
 #define GIF_MAX_WIDTH 0xffff
 #define GIF_MAX_HEIGHT 0xffff
 #define GIF_MAX_COLORS 256
-
-// Minimum amount of memory needed to create the GIF encoder.
-// In total you will need this + GIF_OUT_BUFFER_MIN_CAPACITY bytes to encode any GIF.
-isize gif_encoder_required_memory(void);
 
 typedef struct GifEncoder GifEncoder;
 
@@ -107,6 +99,7 @@ void gif_encoder_start_frame(
 );
 
 // Returns the number of pixels consumed. Call it repeatedly until all frame pixels are consumed.
+// Returns -1 if encoder runs out of memory. You can't recover from this.
 isize gif_encoder_feed_frame(
     GifEncoder *encoder,
     GifColorIndex const *pixels, isize pixel_count,
@@ -116,7 +109,9 @@ isize gif_encoder_feed_frame(
 void gif_encoder_finish_frame(GifEncoder *encoder, GifOutputBuffer *out_buffer);
 
 // A shorthand for: start_frame -> feed_frame ... feed_frame -> finish_frame
-// Fails and returns false if there is not enough memory in the buffer for the entire encoded frame.
+//
+// Fails and returns false if there is not enough memory in the buffer for the entire encoded frame
+// or if we run out of memory in the process.
 bool gif_encode_whole_frame(
     GifEncoder *encoder,
     u8 const *local_colors, isize color_count,
