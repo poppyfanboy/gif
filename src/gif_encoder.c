@@ -4,7 +4,6 @@
 // - https://web.archive.org/web/20180620143135/https://www.vurdalakov.net/misc/gif/netscape-looping-application-extension
 
 // TODO: Transdiff from ffmpeg: unchanged pixels are encoded as transparent on next frame.
-// TODO: Color search: partition space, create list of possible closest colors for each partition.
 // TODO: Color search: sort colors along 3 axis, first check colors which have closer projections.
 // TODO: Implement dithering? I don't know how it's done (though, random one should be easy).
 // TODO: Pass the number of color components in arguments (1 for monochrome, 3 for RGB, 4 for RGBA).
@@ -16,7 +15,7 @@
 #include <stdlib.h> // qsort
 #include <stddef.h> // size_t, NULL
 #include <math.h>   // copysignf, powf, roundf, cbrtf, INFINITY
-#include <string.h> // memmove, memcpy, memset, memcmp
+#include <string.h> // memmove, memcpy, memset
 
 // *Really* minimal PCG32 code / (c) 2014 M.E. O'Neill / pcg-random.org
 // Licensed under Apache License 2.0 (NO WARRANTY, etc. see website)
@@ -144,6 +143,54 @@ typedef struct {
     f32 y;
     f32 z;
 } f32x3;
+
+static inline f32x3 f32x3_max(f32x3 left, f32x3 right) {
+    return (f32x3){
+        left.x > right.x ? left.x : right.x,
+        left.y > right.y ? left.y : right.y,
+        left.z > right.z ? left.z : right.z,
+    };
+}
+
+static inline f32x3 f32x3_min(f32x3 left, f32x3 right) {
+    return (f32x3){
+        left.x < right.x ? left.x : right.x,
+        left.y < right.y ? left.y : right.y,
+        left.z < right.z ? left.z : right.z,
+    };
+}
+
+static inline f32x3 f32x3_add(f32x3 left, f32x3 right) {
+    return (f32x3){left.x + right.x, left.y + right.y, left.z + right.z};
+}
+
+static inline f32x3 f32x3_sub(f32x3 left, f32x3 right) {
+    return (f32x3){left.x - right.x, left.y - right.y, left.z - right.z};
+}
+
+static inline f32x3 f32x3_mul(f32x3 left, f32x3 right) {
+    return (f32x3){left.x * right.x, left.y * right.y, left.z * right.z};
+}
+
+static inline f32 f32x3_dot(f32x3 left, f32x3 right) {
+    return left.x * right.x + left.y * right.y + left.z * right.z;
+}
+
+static inline f32x3 f32x3_scale(f32x3 vector, f32 scalar) {
+    return (f32x3){vector.x * scalar, vector.y * scalar, vector.z * scalar};
+}
+
+static inline f32x3 f32x3_clamp(f32x3 value, f32x3 min, f32x3 max) {
+    if (value.x < min.x) { value.x = min.x; }
+    if (value.y < min.y) { value.y = min.y; }
+    if (value.z < min.z) { value.z = min.z; }
+
+    if (value.x > max.x) { value.x = max.x; }
+    if (value.y > max.y) { value.y = max.y; }
+    if (value.z > max.z) { value.z = max.z; }
+
+    return value;
+}
 
 #define ARENA_ALIGNMENT 16
 
@@ -1016,8 +1063,19 @@ f32 *palette_by_k_means(
         return NULL;
     }
 
-    f32x3 *colors = (f32x3 *)colors_raw;
+    f32x3 *colors = arena_alloc(arena, color_count * sizeof(f32x3));
     f32x3 *colors_end = colors + color_count;
+    if (colors == NULL) {
+        *colors_generated = 0;
+        return NULL;
+    }
+    {
+        f32 const *raw_color_iter = colors_raw;
+        for (isize i = 0; i < color_count; i += 1) {
+            colors[i] = (f32x3){raw_color_iter[0], raw_color_iter[1], raw_color_iter[2]};
+            raw_color_iter += COMPONENTS_PER_COLOR;
+        }
+    }
 
     // In total the whole image contained less colors than we asked for.
     if (color_count <= target_color_count) {
@@ -1512,153 +1570,12 @@ u8 *palette_by_modified_median_cut(
     return palette;
 }
 
-typedef struct {
-    f32x3 color;
-    GifColorIndex color_index;
-} IndexedColor;
-
-typedef int (*IndexedColorComparator)(void const *, void const *);
-
-static int indexed_color_compare_by_x(void const *left, void const *right) {
-    f32x3 left_color = ((IndexedColor *)left)->color;
-    f32x3 right_color = ((IndexedColor *)right)->color;
-
-    return (int)copysignf(1.0F, left_color.x - right_color.x);
-}
-
-static int indexed_color_compare_by_y(void const *left, void const *right) {
-    f32x3 left_color = ((IndexedColor *)left)->color;
-    f32x3 right_color = ((IndexedColor *)right)->color;
-
-    return (int)copysignf(1.0F, left_color.y - right_color.y);
-}
-
-static int indexed_color_compare_by_z(void const *left, void const *right) {
-    f32x3 left_color = ((IndexedColor *)left)->color;
-    f32x3 right_color = ((IndexedColor *)right)->color;
-
-    return (int)copysignf(1.0F, left_color.z - right_color.z);
-}
-
-typedef struct ColorTreeNode ColorTreeNode;
-
-// K-d tree for closest color lookups.
-struct ColorTreeNode {
-    f32 median;
-    ColorTreeNode *left;
-    ColorTreeNode *right;
-    IndexedColor value;
-};
-
-static ColorTreeNode *color_tree_construct(
-    IndexedColor *colors,
-    isize color_count,
-    isize depth,
-    Arena *arena
-) {
-    assert(color_count != 0);
-
-    ColorTreeNode *node = arena_alloc(arena, sizeof(ColorTreeNode));
-
-    if (color_count > 1) {
-        isize color_component_index = depth % 3;
-
-        IndexedColorComparator comparator = (IndexedColorComparator[]){
-            indexed_color_compare_by_x,
-            indexed_color_compare_by_y,
-            indexed_color_compare_by_z,
-        }[color_component_index];
-        qsort(colors, (size_t)color_count, sizeof(IndexedColor), comparator);
-
-        isize middle = color_count / 2;
-
-        IndexedColor median = colors[middle];
-        node->median = (f32[]){
-            median.color.x,
-            median.color.y,
-            median.color.z,
-        }[color_component_index];
-
-        // The median value goes into the right subtree.
-        node->left = color_tree_construct(colors, middle, depth + 1, arena);
-        node->right = color_tree_construct(colors + middle, color_count - middle, depth + 1, arena);
-    } else {
-        node->left = NULL;
-        node->right = NULL;
-        node->value = colors[0];
-    }
-
-    return node;
-}
-
-// distance_to_nearest is actually squared distance.
-static void color_tree_get_nearest(
-    ColorTreeNode *node,
-    f32x3 search_color,
-    isize depth,
-    f32 *distance_to_nearest,
-    GifColorIndex *nearest_color_index
-) {
-    if (node->left != NULL) {
-        f32 search_color_component = (f32[]){
-            search_color.x,
-            search_color.y,
-            search_color.z,
-        }[depth % 3];
-
-        // This one is checked always:
-        ColorTreeNode *subtree;
-        // This one is checked only if needed:
-        ColorTreeNode *other_subtree;
-        if (search_color_component < node->median) {
-            subtree = node->left;
-            other_subtree = node->right;
-        } else {
-            subtree = node->right;
-            other_subtree = node->left;
-        }
-
-        color_tree_get_nearest(
-            subtree,
-            search_color,
-            depth + 1,
-            distance_to_nearest,
-            nearest_color_index
-        );
-
-        f32 other_subtree_min_distance =
-            (node->median - search_color_component) * (node->median - search_color_component);
-        if (other_subtree_min_distance < *distance_to_nearest) {
-            color_tree_get_nearest(
-                other_subtree,
-                search_color,
-                depth + 1,
-                distance_to_nearest,
-                nearest_color_index
-            );
-        }
-    } else {
-        // Leaf node
-        assert(node->left == NULL && node->right == NULL);
-
-        f32 current_distance =
-            (node->value.color.x - search_color.x) * (node->value.color.x - search_color.x) +
-            (node->value.color.y - search_color.y) * (node->value.color.y - search_color.y) +
-            (node->value.color.z - search_color.z) * (node->value.color.z - search_color.z);
-
-        if (current_distance < *distance_to_nearest) {
-            *distance_to_nearest = current_distance;
-            *nearest_color_index = node->value.color_index;
-        }
-    }
-}
-
 GifColorIndex *image_quantize_for_gif(
     f32 const *pixels, isize pixel_count,
     f32 const *colors, isize color_count,
     void *arena
 ) {
-    assert(color_count <= (isize)GIF_COLOR_INDEX_MAX + 1);
+    assert(0 < color_count && color_count <= (isize)GIF_COLOR_INDEX_MAX + 1);
 
     GifColorIndex *indexed_pixels = arena_alloc(arena, pixel_count * sizeof(GifColorIndex));
     if (indexed_pixels == NULL) {
@@ -1667,39 +1584,156 @@ GifColorIndex *image_quantize_for_gif(
 
     ArenaSnapshot snapshot = arena_snapshot(arena);
 
-    IndexedColor *indexed_colors = arena_alloc(arena, color_count * sizeof(IndexedColor));
-    if (indexed_colors == NULL) {
+    typedef struct {
+        f32x3 min;
+        f32x3 max;
+    } Box;
+
+    // A bounding box for the "colors" array.
+    Box color_box = {
+        .min = { INFINITY,  INFINITY,  INFINITY},
+        .max = {-INFINITY, -INFINITY, -INFINITY},
+    };
+    f32 const *color_iter = colors;
+    while (color_iter < colors + COMPONENTS_PER_COLOR * color_count) {
+        f32x3 color = {color_iter[0], color_iter[1], color_iter[2]};
+        color_box.min = f32x3_min(color, color_box.min);
+        color_box.max = f32x3_max(color, color_box.max);
+
+        color_iter += COMPONENTS_PER_COLOR;
+    }
+
+    isize const GRID_SIZE = 16;
+    f32x3 color_cell_size = f32x3_scale(f32x3_sub(color_box.max, color_box.min), 1.0F / GRID_SIZE);
+
+    typedef struct {
+        f32x3 color;
+        GifColorIndex color_index;
+    } IndexedColor;
+
+    typedef struct {
+        isize count;
+        IndexedColor colors[];
+    } ColorCandidates;
+
+    ColorCandidates **cell_candidates =
+        arena_alloc(arena, GRID_SIZE * GRID_SIZE * GRID_SIZE * sizeof(ColorCandidates *));
+    if (cell_candidates == NULL) {
         return NULL;
     }
-    {
-        f32 const *color_iter = colors;
-        GifColorIndex index = 0;
-        while (color_iter != colors + color_count * COMPONENTS_PER_COLOR) {
-            indexed_colors[index].color_index = index;
-            indexed_colors[index].color = (f32x3){color_iter[0], color_iter[1], color_iter[2]};
 
-            index += 1;
+    // Create a list of candidate palette colors for each cell. When an image pixel falls into some
+    // cell, the closest palette color can be found among the candidates.
+    for (isize cell_index = 0; cell_index < GRID_SIZE * GRID_SIZE * GRID_SIZE; cell_index += 1) {
+        f32x3 cell_coords = {
+            cell_index % GRID_SIZE,
+            (cell_index / GRID_SIZE) % GRID_SIZE,
+            (cell_index / (GRID_SIZE * GRID_SIZE)) % GRID_SIZE,
+        };
+        f32x3 cell_min = f32x3_add(color_box.min, f32x3_mul(color_cell_size, cell_coords));
+        Box cell = {cell_min, f32x3_add(cell_min, color_cell_size)};
+
+        // Find the "best" (i.e. min) distance out of all possible max distances from the palette
+        // colors to the points inside the cell. If a min distance from some color to the cell
+        // points is larger than that, then this color is not worth checking.
+        f32 best_max_distance = INFINITY;
+        f32 const *color_iter = colors;
+        while (color_iter < colors + color_count * COMPONENTS_PER_COLOR) {
+            f32x3 color = {color_iter[0], color_iter[1], color_iter[2]};
+
+            // Obviously works when the color component is between min and max.
+            // Otherwise works because one of the differences gets negative.
+            f32x3 farthest_point = {
+                color.x - cell.min.x >= cell.max.x - color.x ? cell.min.x : cell.max.x,
+                color.y - cell.min.y >= cell.max.y - color.y ? cell.min.y : cell.max.y,
+                color.z - cell.min.z >= cell.max.z - color.z ? cell.min.z : cell.max.z,
+            };
+            f32 max_distance = f32x3_dot(
+                f32x3_sub(color, farthest_point),
+                f32x3_sub(color, farthest_point)
+            );
+
+            if (max_distance < best_max_distance) {
+                best_max_distance = max_distance;
+            }
+
             color_iter += COMPONENTS_PER_COLOR;
         }
-    }
 
-    if (arena_memory_left(arena) < color_count * sizeof(ColorTreeNode)) {
-        return NULL;
+        // Conservative allocation in front, tighten it later. Allocating memory this way also plays
+        // nicely with an idea of extending the arena memory using the GIF_LIB_REPORT_ALLOC hook.
+        ArenaSnapshot snapshot = arena_snapshot(arena);
+        ColorCandidates *candidates =
+            arena_alloc(arena, sizeof(ColorCandidates) + color_count * sizeof(IndexedColor));
+        if (candidates == NULL) {
+            return NULL;
+        }
+        candidates->count = 0;
+
+        GifColorIndex color_index = 0;
+        color_iter = colors;
+        while (color_iter < colors + color_count * COMPONENTS_PER_COLOR) {
+            f32x3 color = {color_iter[0], color_iter[1], color_iter[2]};
+
+            f32x3 closest_point = f32x3_clamp(color, cell.min, cell.max);
+            f32 min_distance = f32x3_dot(
+                f32x3_sub(color, closest_point),
+                f32x3_sub(color, closest_point)
+            );
+
+            // Otherwise this color is not worth looking into: a better candidate for any point
+            // inside the current cell is the one which had "best_max_distance" distance in the
+            // worst case.
+            if (min_distance <= best_max_distance) {
+                candidates->colors[candidates->count++] = (IndexedColor){
+                    .color = color,
+                    .color_index = color_index,
+                };
+            }
+
+            color_iter += COMPONENTS_PER_COLOR;
+            color_index += 1;
+        }
+
+        arena_rewind(arena, snapshot);
+        cell_candidates[cell_index] =
+            arena_alloc(arena, sizeof(ColorCandidates) + candidates->count * sizeof(IndexedColor));
     }
-    ColorTreeNode *color_tree = color_tree_construct(indexed_colors, color_count, 0, arena);
 
     f32 const *pixel_iter = pixels;
     GifColorIndex *indexed_pixel_iter = indexed_pixels;
     while (pixel_iter != pixels + pixel_count * COMPONENTS_PER_COLOR) {
+        f32x3 pixel = {pixel_iter[0], pixel_iter[1], pixel_iter[2]};
+
+        // If a pixel falls outside of the palette bounding box, look through the candidates of a
+        // clamped point. I'm not exactly sure, but I think there is no way a closer color could be
+        // found among the candidates from the neighboring cells (or any other cells).
+        isize cell_x =
+            isize_clamp((pixel.x - color_box.min.x) / color_cell_size.x, 0, GRID_SIZE - 1);
+        isize cell_y =
+            isize_clamp((pixel.y - color_box.min.y) / color_cell_size.y, 0, GRID_SIZE - 1);
+        isize cell_z =
+            isize_clamp((pixel.z - color_box.min.z) / color_cell_size.z, 0, GRID_SIZE - 1);
+
+        isize cell_index = cell_x + cell_y * GRID_SIZE + cell_z * GRID_SIZE * GRID_SIZE;
+
         GifColorIndex nearest_color_index;
         f32 distance_to_nearest = INFINITY;
-        color_tree_get_nearest(
-            color_tree,
-            (f32x3){pixel_iter[0], pixel_iter[1], pixel_iter[2]},
-            0,
-            &distance_to_nearest,
-            &nearest_color_index
-        );
+
+        ColorCandidates *candidates = cell_candidates[cell_index];
+        for (isize i = 0; i < candidates->count; i += 1) {
+            IndexedColor candidate = candidates->colors[i];
+            f32 distance = f32x3_dot(
+                f32x3_sub(candidate.color, pixel),
+                f32x3_sub(candidate.color, pixel)
+            );
+
+            if (distance < distance_to_nearest) {
+                distance_to_nearest = distance;
+                nearest_color_index = candidate.color_index;
+            }
+        }
+
         *indexed_pixel_iter = nearest_color_index;
 
         pixel_iter += COMPONENTS_PER_COLOR;
