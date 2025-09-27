@@ -144,7 +144,8 @@ u8 *oklab_to_srgb(f32 const *oklab_colors, isize color_count, void *arena);
 
 
 // Generate a custom color palette that best fits the given image.
-// Palette generation functions work best when you pass them unique colors.
+// Less colors passed to the palette generation algorithm the faster it works. Palette quality will
+// differ depending on the specific algorithm.
 
 u8 *colors_unique(u8 const *colors, isize color_count, isize *unique_color_count, void *arena);
 
@@ -162,6 +163,7 @@ f32 *palette_by_k_means(
     f32 const *colors, isize color_count,
     isize target_color_count,
     isize *colors_generated,
+    bool k_means_plus_plus,
     void *arena
 );
 

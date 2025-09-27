@@ -4,7 +4,7 @@
 //        [-memory <arena size in MiB>]
 //        [-color-space (srgb|linear|lab|oklab)]
 //        [-palette (web-safe|monochrome|black-white|<file>)]
-//        [-palette-gen (median-cut|k-means|modified-median-cut)]
+//        [-palette-gen (median-cut|k-means|k-means++|modified-median-cut)]
 //        [-color-count <generated palette color count>]
 
 #include <stdlib.h>     // malloc, free, strtoll, abort
@@ -85,7 +85,7 @@ int main(int arg_count, char **args) {
 
     ColorSpace color_space = SRGB;
     enum { WEB_SAFE, MONOCHROME, BLACK_WHITE, GENERATE, FROM_FILE } palette = GENERATE;
-    enum { MEDIAN_CUT, K_MEANS, MODIFIED_MEDIAN_CUT } palette_gen = MEDIAN_CUT;
+    enum { MEDIAN_CUT, K_MEANS, K_MEANS_PLUS_PLUS, MODIFIED_MEDIAN_CUT } palette_gen = MEDIAN_CUT;
     char const *palette_file_name = NULL;
     isize max_color_count = 256;
 
@@ -149,6 +149,8 @@ int main(int arg_count, char **args) {
                 palette_gen = K_MEANS;
             } else if (strcmp(palette_gen_arg, "modified-median-cut") == 0) {
                 palette_gen = MODIFIED_MEDIAN_CUT;
+            } else if (strcmp(palette_gen_arg, "k-means++") == 0) {
+                palette_gen = K_MEANS_PLUS_PLUS;
             } else {
                 fprintf(stderr, "Invalid palette generation method: '%s'\n", palette_gen_arg);
                 return 1;
@@ -183,28 +185,23 @@ int main(int arg_count, char **args) {
 
     // Read the pixels from the file.
 
-    f32 *pixels;
     int image_width, image_height;
-
-    u8 *unique_srgb_pixels;
-    f32 *unique_pixels;
-    isize unique_pixel_count;
-    {
-        u8 *srgb_pixels = stbi_load(input_file_name, &image_width, &image_height, NULL, 3);
-        if (srgb_pixels == NULL) {
-            fprintf(stderr, "Failed to load the input image: '%s'\n", input_file_name);
-            return 1;
-        }
-
-        pixels = from_srgb(srgb_pixels, image_width * image_height, color_space, &arena);
-
-        unique_srgb_pixels = colors_unique_inplace(
-            srgb_pixels, (isize)image_width * image_height,
-            &unique_pixel_count,
-            &arena
-        );
-        unique_pixels = from_srgb(unique_srgb_pixels, unique_pixel_count, color_space, &arena);
+    u8 *srgb_pixels = stbi_load(input_file_name, &image_width, &image_height, NULL, 3);
+    if (srgb_pixels == NULL) {
+        fprintf(stderr, "Failed to load the input image: '%s'\n", input_file_name);
+        return 1;
     }
+
+    f32 *pixels = from_srgb(srgb_pixels, image_width * image_height, color_space, &arena);
+    isize pixel_count = (isize)image_width * image_height;
+
+    isize unique_pixel_count;
+    u8 *unique_srgb_pixels = colors_unique_inplace(
+        srgb_pixels, pixel_count,
+        &unique_pixel_count,
+        &arena
+    );
+    f32 *unique_pixels = from_srgb(unique_srgb_pixels, unique_pixel_count, color_space, &arena);
 
     // Pick a color palette.
 
@@ -238,6 +235,18 @@ int main(int arg_count, char **args) {
                 unique_pixels, unique_pixel_count,
                 max_color_count,
                 &color_count,
+                false,
+                &arena
+            );
+            srgb_colors = into_srgb(colors, color_count, color_space, &arena);
+        } break;
+
+        case K_MEANS_PLUS_PLUS: {
+            colors = palette_by_k_means(
+                pixels, pixel_count,
+                max_color_count,
+                &color_count,
+                true,
                 &arena
             );
             srgb_colors = into_srgb(colors, color_count, color_space, &arena);
@@ -245,7 +254,7 @@ int main(int arg_count, char **args) {
 
         case MODIFIED_MEDIAN_CUT: {
             srgb_colors = palette_by_modified_median_cut(
-                unique_srgb_pixels, unique_pixel_count,
+                srgb_pixels, pixel_count,
                 max_color_count,
                 &color_count,
                 &arena

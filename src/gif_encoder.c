@@ -1051,6 +1051,7 @@ f32 *palette_by_k_means(
     f32 const *colors_raw, isize color_count,
     isize target_color_count,
     isize *colors_generated,
+    bool k_means_plus_plus,
     void *arena
 ) {
     isize const MAX_ITERATIONS = 300;
@@ -1085,6 +1086,9 @@ f32 *palette_by_k_means(
         return palette;
     }
 
+    pcg32_random_t rng;
+    pcg32_srandom_r(&rng, (u64)memcpy, (u64)memmove);
+
     // Pick the initial set of centroids randomly from the image colors.
     isize centroid_count = target_color_count;
     f32x3 *centroids = arena_alloc(arena, centroid_count * sizeof(f32x3));
@@ -1093,9 +1097,83 @@ f32 *palette_by_k_means(
         *colors_generated = 0;
         return NULL;
     }
-    pcg32_random_t rng;
-    pcg32_srandom_r(&rng, (u64)memcpy, (u64)memmove);
-    {
+
+    if (k_means_plus_plus) {
+        ArenaSnapshot snapshot = arena_snapshot(arena);
+        f32 *nearest_centroid_distance = arena_alloc(arena, color_count * sizeof(f32x3));
+        if (nearest_centroid_distance == NULL) {
+            *colors_generated = 0;
+            return NULL;
+        }
+
+        f32x3 *remaining_colors = colors;
+        f32x3 *centroid_iter = centroids;
+
+        isize first_centroid_index = f64_random(&rng) * (colors_end - remaining_colors);
+        *(centroid_iter++) = remaining_colors[first_centroid_index];
+        {
+            f32x3 swap = remaining_colors[first_centroid_index];
+            remaining_colors[first_centroid_index] = remaining_colors[0];
+            remaining_colors[0] = swap;
+            remaining_colors += 1;
+        }
+
+        f64 centroid_distance_sum = 0.0;
+        for (isize i = 0; i < colors_end - remaining_colors; i += 1) {
+             f32 distance = f32x3_dot(
+                f32x3_sub(centroids[0], remaining_colors[i]),
+                f32x3_sub(centroids[0], remaining_colors[i])
+            );
+            nearest_centroid_distance[i] = distance;
+            centroid_distance_sum += distance;
+        }
+
+        while (centroid_iter - centroids < target_color_count) {
+            isize next_centroid_index;
+            f32x3 next_centroid;
+            {
+                f64 random = f64_random(&rng) * centroid_distance_sum;
+                f64 running_sum = 0.0;
+                for (isize i = 0; i < colors_end - remaining_colors; i += 1) {
+                    running_sum += nearest_centroid_distance[i];
+                    if (running_sum >= random) {
+                        next_centroid_index = i;
+                        next_centroid = remaining_colors[i];
+                        break;
+                    }
+                }
+            }
+
+            *(centroid_iter++) = next_centroid;
+            {
+                f32x3 swap = remaining_colors[next_centroid_index];
+                remaining_colors[next_centroid_index] = remaining_colors[0];
+                remaining_colors[0] = swap;
+
+                remaining_colors += 1;
+            }
+            {
+                f32 swap = nearest_centroid_distance[next_centroid_index];
+                nearest_centroid_distance[next_centroid_index] = nearest_centroid_distance[0];
+                nearest_centroid_distance[0] = swap;
+
+                nearest_centroid_distance += 1;
+            }
+
+            for (isize i = 0; i < colors_end - remaining_colors; i += 1) {
+                f32 distance = f32x3_dot(
+                    f32x3_sub(remaining_colors[i], next_centroid),
+                    f32x3_sub(remaining_colors[i], next_centroid)
+                );
+                if (distance < nearest_centroid_distance[i]) {
+                    centroid_distance_sum -= nearest_centroid_distance[i] - distance;
+                    nearest_centroid_distance[i] = distance;
+                }
+            }
+        }
+
+        arena_rewind(arena, snapshot);
+    } else {
         f32x3 *centroid_iter = centroids;
         f32x3 *color_iter = colors;
         for (isize i = 0; i < centroid_count; i += 1) {
