@@ -178,6 +178,16 @@ u8 *palette_by_modified_median_cut(
     void *arena
 );
 
+// Octree palette generation implemented following these articles:
+//  - https://www.cubic.org/docs/octree.htm
+//  - https://observablehq.com/@tmcw/octree-color-quantization
+u8 *palette_by_octree(
+    u8 const *colors, isize color_count,
+    isize target_color_count,
+    isize *colors_generated,
+    void *arena
+);
+
 
 // Prepare an image to be fed into the GIF encoder.
 

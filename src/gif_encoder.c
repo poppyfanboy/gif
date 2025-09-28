@@ -1648,6 +1648,178 @@ u8 *palette_by_modified_median_cut(
     return palette;
 }
 
+u8 *palette_by_octree(
+    u8 const *colors, isize color_count,
+    isize target_color_count,
+    isize *colors_generated,
+    void *arena
+) {
+    ArenaSnapshot snapshot = arena_snapshot(arena);
+
+    u8 *palette = arena_alloc(arena, target_color_count * COMPONENTS_PER_COLOR * sizeof(u8));
+    if (palette == NULL) {
+        *colors_generated = 0;
+        return NULL;
+    }
+
+    enum { MAX_LEVEL = 8 };
+
+    typedef struct Node Node;
+
+    struct Node {
+        u64 color[3];
+        isize reference_count;
+        Node *children[8];
+
+        Node *next_sibling;
+        Node *previous_sibling;
+    };
+
+    Node root = {
+        .color = {0},
+        .reference_count = 0,
+    };
+
+    struct {
+        Node *first;
+        Node *last;
+    } nodes_by_level[MAX_LEVEL + 1] = {[0] = {&root, &root}};
+
+    isize leaf_node_count = 0;
+
+    // Push the colors to the very bottom of the octree.
+    u8 const *color_iter = colors;
+    while (color_iter < colors + color_count * COMPONENTS_PER_COLOR) {
+        Node *tree_iter = &root;
+        isize level = 0;
+        while (level < MAX_LEVEL) {
+            isize child_index =
+                ((color_iter[0] >> (MAX_LEVEL - level - 1)) & 0x1) << 0 |
+                ((color_iter[1] >> (MAX_LEVEL - level - 1)) & 0x1) << 1 |
+                ((color_iter[2] >> (MAX_LEVEL - level - 1)) & 0x1) << 2;
+
+            if (tree_iter->children[child_index] == NULL) {
+                Node *new_child = arena_alloc(arena, sizeof(Node));
+                if (new_child == NULL) {
+                    *colors_generated = 0;
+                    return NULL;
+                }
+                memset(new_child, 0, sizeof(Node));
+
+                // "level + 1" is because the leaves are on the level below.
+
+                if (nodes_by_level[level + 1].first == NULL) {
+                    nodes_by_level[level + 1].first = new_child;
+                    nodes_by_level[level + 1].last = new_child;
+                } else {
+                    nodes_by_level[level + 1].last->next_sibling = new_child;
+                    new_child->previous_sibling = nodes_by_level[level + 1].last;
+
+                    nodes_by_level[level + 1].last = new_child;
+                }
+
+                if (level + 1 == MAX_LEVEL) {
+                    leaf_node_count += 1;
+                }
+
+                tree_iter->children[child_index] = new_child;
+            }
+
+            tree_iter = tree_iter->children[child_index];
+            level += 1;
+        }
+
+        tree_iter->reference_count += 1;
+        tree_iter->color[0] += color_iter[0];
+        tree_iter->color[1] += color_iter[1];
+        tree_iter->color[2] += color_iter[2];
+
+        color_iter += COMPONENTS_PER_COLOR;
+    }
+
+    // Reduce the tree nodes until we reach the required number of leaves in the tree.
+    // Start merging from one level above the very bottom one.
+    isize level = MAX_LEVEL;
+    Node *sibling_iter = NULL;
+    while (leaf_node_count > target_color_count) {
+        if (sibling_iter == NULL) {
+            level -= 1;
+            sibling_iter = nodes_by_level[level].first;
+        }
+        if (level < 0) {
+            break;
+        }
+
+        for (isize i = 0; i < countof(sibling_iter->children); i += 1) {
+            Node *child = sibling_iter->children[i];
+
+            if (child != NULL) {
+                sibling_iter->reference_count += child->reference_count;
+                sibling_iter->color[0] += child->color[0];
+                sibling_iter->color[1] += child->color[1];
+                sibling_iter->color[2] += child->color[2];
+
+                if (child->previous_sibling != NULL) {
+                    child->previous_sibling->next_sibling = child->next_sibling;
+                }
+                if (child->next_sibling != NULL) {
+                    child->next_sibling->previous_sibling = child->previous_sibling;
+                }
+                if (child == nodes_by_level[level + 1].first) {
+                    nodes_by_level[level + 1].first = child->next_sibling;
+                }
+                if (child == nodes_by_level[level + 1].last) {
+                    nodes_by_level[level + 1].last = child->previous_sibling;
+                }
+
+                leaf_node_count -= 1;
+            }
+
+            sibling_iter->children[i] = NULL;
+        }
+
+        // The node that we merged the children into became the leaf node itself.
+        leaf_node_count += 1;
+
+        sibling_iter = sibling_iter->next_sibling;
+    }
+
+    u8 *palette_iter = palette;
+    isize palette_size = 0;
+
+    level = MAX_LEVEL + 1;
+    sibling_iter = NULL;
+    for (isize i = 0; i < target_color_count; i += 1) {
+        while (sibling_iter == NULL && level >= 0) {
+            level -= 1;
+            sibling_iter = nodes_by_level[level].first;
+        }
+        if (level < 0) {
+            break;
+        }
+
+        if (sibling_iter->reference_count == 0) {
+            break;
+        }
+
+        palette_iter[0] = sibling_iter->color[0] / sibling_iter->reference_count;
+        palette_iter[1] = sibling_iter->color[1] / sibling_iter->reference_count;
+        palette_iter[2] = sibling_iter->color[2] / sibling_iter->reference_count;
+
+        sibling_iter = sibling_iter->next_sibling;
+
+        palette_iter += COMPONENTS_PER_COLOR;
+        palette_size += 1;
+    }
+
+    // Tighten the initial palette allocation.
+    arena_rewind(arena, snapshot);
+    *colors_generated = palette_size;
+    palette = arena_alloc(arena, palette_size * COMPONENTS_PER_COLOR * sizeof(f32));
+
+    return palette;
+}
+
 GifColorIndex *image_quantize_for_gif(
     f32 const *pixels, isize pixel_count,
     f32 const *colors, isize color_count,
