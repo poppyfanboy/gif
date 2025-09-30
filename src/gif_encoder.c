@@ -5,9 +5,7 @@
 
 // TODO: Transdiff from ffmpeg: unchanged pixels are encoded as transparent on next frame.
 // TODO: Color search: sort colors along 3 axis, first check colors which have closer projections.
-// TODO: Implement dithering? I don't know how it's done (though, random one should be easy).
 // TODO: Pass the number of color components in arguments (1 for monochrome, 3 for RGB, 4 for RGBA).
-// TODO: Try using k-means++ for picking an initial set of centroids in k-means.
 
 #include "gif_encoder.h"
 
@@ -143,6 +141,11 @@ typedef struct {
     f32 y;
     f32 z;
 } f32x3;
+
+typedef struct {
+    f32x3 min;
+    f32x3 max;
+} f32xbox;
 
 static inline f32x3 f32x3_max(f32x3 left, f32x3 right) {
     return (f32x3){
@@ -1706,7 +1709,7 @@ u8 *palette_by_octree(
                 }
                 memset(new_child, 0, sizeof(Node));
 
-                // "level + 1" is because the leaves are on the level below.
+                // "level + 1" is because the current node children are on the level below.
 
                 if (nodes_by_level[level + 1].first == NULL) {
                     nodes_by_level[level + 1].first = new_child;
@@ -1820,7 +1823,205 @@ u8 *palette_by_octree(
     return palette;
 }
 
-GifColorIndex *image_quantize_for_gif(
+#define COLOR_TABLE_GRID_SIZE 16
+
+#define COLOR_TABLE_CELL_COUNT  \
+    ((isize)                    \
+        COLOR_TABLE_GRID_SIZE * \
+        COLOR_TABLE_GRID_SIZE * \
+        COLOR_TABLE_GRID_SIZE   \
+    )
+
+typedef struct {
+    f32x3 color;
+    GifColorIndex index;
+} IndexedColor;
+
+// A list of closest-color candidates for a grid cell to brute-force on.
+typedef struct {
+    isize count;
+    IndexedColor colors[];
+} ColorTableCandidates;
+
+typedef struct {
+    f32xbox bounding_box;
+    f32x3 cell_size;
+    ColorTableCandidates **candidates;
+} ColorTable;
+
+static ColorTable *color_table_create(f32 const *colors, isize color_count, Arena *arena) {
+    assert(0 < color_count && color_count <= (isize)GIF_COLOR_INDEX_MAX + 1);
+
+    ColorTable *table = arena_alloc(arena, sizeof(ColorTable));
+    if (table == NULL) {
+        return NULL;
+    }
+
+    // A bounding box for the "colors" array.
+    {
+        table->bounding_box.min = (f32x3){ INFINITY,  INFINITY,  INFINITY};
+        table->bounding_box.max = (f32x3){-INFINITY, -INFINITY, -INFINITY};
+
+        f32 const *color_iter = colors;
+        while (color_iter < colors + COMPONENTS_PER_COLOR * color_count) {
+            f32x3 color = {color_iter[0], color_iter[1], color_iter[2]};
+            table->bounding_box.min = f32x3_min(table->bounding_box.min, color);
+            table->bounding_box.max = f32x3_max(table->bounding_box.max, color);
+
+            color_iter += COMPONENTS_PER_COLOR;
+        }
+    }
+    table->cell_size = f32x3_scale(
+        f32x3_sub(table->bounding_box.max, table->bounding_box.min),
+        1.0F / COLOR_TABLE_GRID_SIZE
+    );
+
+    table->candidates = arena_alloc(arena, COLOR_TABLE_CELL_COUNT * sizeof(ColorTableCandidates *));
+    if (table->candidates == NULL) {
+        return NULL;
+    }
+
+    // Create a list of candidate palette colors for each cell. When an image pixel falls into some
+    // cell, the closest palette color can be found among the candidates.
+    for (isize cell_index = 0; cell_index < COLOR_TABLE_CELL_COUNT; cell_index += 1) {
+        f32x3 cell_coords = {
+            cell_index
+                % COLOR_TABLE_GRID_SIZE,
+            cell_index / COLOR_TABLE_GRID_SIZE
+                % COLOR_TABLE_GRID_SIZE,
+            cell_index / (COLOR_TABLE_GRID_SIZE * COLOR_TABLE_GRID_SIZE)
+                % COLOR_TABLE_GRID_SIZE,
+        };
+
+        f32xbox cell;
+        cell.min = f32x3_add(table->bounding_box.min, f32x3_mul(table->cell_size, cell_coords));
+        cell.max = f32x3_add(cell.min, table->cell_size);
+
+        // Find the "best" (i.e. min) distance out of all possible max distances from the palette
+        // colors to the points inside the cell. If a min distance from some color to the cell
+        // points is larger than that, then this color is not worth checking.
+        f32 best_max_distance = INFINITY;
+        {
+            f32 const *color_iter = colors;
+            while (color_iter < colors + color_count * COMPONENTS_PER_COLOR) {
+                f32x3 color = {color_iter[0], color_iter[1], color_iter[2]};
+
+                // Obviously works when the color component is between min and max.
+                // Otherwise works because one of the differences gets negative.
+                f32x3 farthest_point = {
+                    color.x - cell.min.x >= cell.max.x - color.x ? cell.min.x : cell.max.x,
+                    color.y - cell.min.y >= cell.max.y - color.y ? cell.min.y : cell.max.y,
+                    color.z - cell.min.z >= cell.max.z - color.z ? cell.min.z : cell.max.z,
+                };
+                f32 max_distance = f32x3_dot(
+                    f32x3_sub(color, farthest_point),
+                    f32x3_sub(color, farthest_point)
+                );
+
+                if (max_distance < best_max_distance) {
+                    best_max_distance = max_distance;
+                }
+
+                color_iter += COMPONENTS_PER_COLOR;
+            }
+        }
+
+        // Conservative allocation in front, tighten it later. Allocating memory this way also plays
+        // nicely with an idea of extending the arena memory using the GIF_LIB_REPORT_ALLOC hook.
+        ArenaSnapshot snapshot = arena_snapshot(arena);
+
+        ColorTableCandidates *candidates = arena_alloc(
+            arena,
+            sizeof(ColorTableCandidates) + color_count * sizeof(IndexedColor)
+        );
+        if (candidates == NULL) {
+            return NULL;
+        }
+        candidates->count = 0;
+
+        // Populate the list of candidate colors with the ones worth checking when a query color
+        // falls into the current cell.
+        {
+            GifColorIndex color_index = 0;
+            f32 const *color_iter = colors;
+
+            while (color_iter < colors + color_count * COMPONENTS_PER_COLOR) {
+                f32x3 color = {color_iter[0], color_iter[1], color_iter[2]};
+
+                f32x3 closest_point = f32x3_clamp(color, cell.min, cell.max);
+                f32 min_distance = f32x3_dot(
+                    f32x3_sub(color, closest_point),
+                    f32x3_sub(color, closest_point)
+                );
+
+                // Otherwise this color is not worth looking into: a better candidate for any point
+                // inside the current cell is the one which had "best_max_distance" distance in the
+                // worst case.
+                if (min_distance <= best_max_distance) {
+                    candidates->colors[candidates->count++] = (IndexedColor){
+                        .color = color,
+                        .index = color_index,
+                    };
+                }
+
+                color_iter += COMPONENTS_PER_COLOR;
+                color_index += 1;
+            }
+        }
+
+        arena_rewind(arena, snapshot);
+        table->candidates[cell_index] = arena_alloc(
+            arena,
+            sizeof(ColorTableCandidates) + candidates->count * sizeof(IndexedColor)
+        );
+    }
+
+    return table;
+}
+
+static IndexedColor color_table_get_closest(ColorTable const *table, f32x3 search_color) {
+    // If a color falls outside of the palette bounding box, look through the candidates of a
+    // clamped point. I'm not exactly sure, but I think there is no way a closer color could be
+    // found among the candidates from the neighboring cells (or any other cells).
+    isize cell_x = isize_clamp(
+        (search_color.x - table->bounding_box.min.x) / table->cell_size.x,
+        0, COLOR_TABLE_GRID_SIZE - 1
+    );
+    isize cell_y = isize_clamp(
+        (search_color.y - table->bounding_box.min.y) / table->cell_size.y,
+        0, COLOR_TABLE_GRID_SIZE - 1
+    );
+    isize cell_z = isize_clamp(
+        (search_color.z - table->bounding_box.min.z) / table->cell_size.z,
+        0, COLOR_TABLE_GRID_SIZE - 1
+    );
+
+    isize cell_index =
+        cell_x +
+        cell_y * COLOR_TABLE_GRID_SIZE +
+        cell_z * COLOR_TABLE_GRID_SIZE * COLOR_TABLE_GRID_SIZE;
+
+    IndexedColor nearest;
+    f32 distance_to_nearest = INFINITY;
+    ColorTableCandidates *candidates = table->candidates[cell_index];
+
+    for (isize i = 0; i < candidates->count; i += 1) {
+        IndexedColor candidate = candidates->colors[i];
+        f32 distance = f32x3_dot(
+            f32x3_sub(candidate.color, search_color),
+            f32x3_sub(candidate.color, search_color)
+        );
+
+        if (distance < distance_to_nearest) {
+            distance_to_nearest = distance;
+            nearest = candidate;
+        }
+    }
+
+    return nearest;
+}
+
+GifColorIndex *image_quantize(
     f32 const *pixels, isize pixel_count,
     f32 const *colors, isize color_count,
     void *arena
@@ -1834,160 +2035,109 @@ GifColorIndex *image_quantize_for_gif(
 
     ArenaSnapshot snapshot = arena_snapshot(arena);
 
-    typedef struct {
-        f32x3 min;
-        f32x3 max;
-    } Box;
-
-    // A bounding box for the "colors" array.
-    Box color_box = {
-        .min = { INFINITY,  INFINITY,  INFINITY},
-        .max = {-INFINITY, -INFINITY, -INFINITY},
-    };
-    f32 const *color_iter = colors;
-    while (color_iter < colors + COMPONENTS_PER_COLOR * color_count) {
-        f32x3 color = {color_iter[0], color_iter[1], color_iter[2]};
-        color_box.min = f32x3_min(color, color_box.min);
-        color_box.max = f32x3_max(color, color_box.max);
-
-        color_iter += COMPONENTS_PER_COLOR;
-    }
-
-    isize const GRID_SIZE = 16;
-    f32x3 color_cell_size = f32x3_scale(f32x3_sub(color_box.max, color_box.min), 1.0F / GRID_SIZE);
-
-    typedef struct {
-        f32x3 color;
-        GifColorIndex color_index;
-    } IndexedColor;
-
-    typedef struct {
-        isize count;
-        IndexedColor colors[];
-    } ColorCandidates;
-
-    ColorCandidates **cell_candidates =
-        arena_alloc(arena, GRID_SIZE * GRID_SIZE * GRID_SIZE * sizeof(ColorCandidates *));
-    if (cell_candidates == NULL) {
+    ColorTable *table = color_table_create(colors, color_count, arena);
+    if (table == NULL) {
         return NULL;
-    }
-
-    // Create a list of candidate palette colors for each cell. When an image pixel falls into some
-    // cell, the closest palette color can be found among the candidates.
-    for (isize cell_index = 0; cell_index < GRID_SIZE * GRID_SIZE * GRID_SIZE; cell_index += 1) {
-        f32x3 cell_coords = {
-            cell_index % GRID_SIZE,
-            (cell_index / GRID_SIZE) % GRID_SIZE,
-            (cell_index / (GRID_SIZE * GRID_SIZE)) % GRID_SIZE,
-        };
-        f32x3 cell_min = f32x3_add(color_box.min, f32x3_mul(color_cell_size, cell_coords));
-        Box cell = {cell_min, f32x3_add(cell_min, color_cell_size)};
-
-        // Find the "best" (i.e. min) distance out of all possible max distances from the palette
-        // colors to the points inside the cell. If a min distance from some color to the cell
-        // points is larger than that, then this color is not worth checking.
-        f32 best_max_distance = INFINITY;
-        f32 const *color_iter = colors;
-        while (color_iter < colors + color_count * COMPONENTS_PER_COLOR) {
-            f32x3 color = {color_iter[0], color_iter[1], color_iter[2]};
-
-            // Obviously works when the color component is between min and max.
-            // Otherwise works because one of the differences gets negative.
-            f32x3 farthest_point = {
-                color.x - cell.min.x >= cell.max.x - color.x ? cell.min.x : cell.max.x,
-                color.y - cell.min.y >= cell.max.y - color.y ? cell.min.y : cell.max.y,
-                color.z - cell.min.z >= cell.max.z - color.z ? cell.min.z : cell.max.z,
-            };
-            f32 max_distance = f32x3_dot(
-                f32x3_sub(color, farthest_point),
-                f32x3_sub(color, farthest_point)
-            );
-
-            if (max_distance < best_max_distance) {
-                best_max_distance = max_distance;
-            }
-
-            color_iter += COMPONENTS_PER_COLOR;
-        }
-
-        // Conservative allocation in front, tighten it later. Allocating memory this way also plays
-        // nicely with an idea of extending the arena memory using the GIF_LIB_REPORT_ALLOC hook.
-        ArenaSnapshot snapshot = arena_snapshot(arena);
-        ColorCandidates *candidates =
-            arena_alloc(arena, sizeof(ColorCandidates) + color_count * sizeof(IndexedColor));
-        if (candidates == NULL) {
-            return NULL;
-        }
-        candidates->count = 0;
-
-        GifColorIndex color_index = 0;
-        color_iter = colors;
-        while (color_iter < colors + color_count * COMPONENTS_PER_COLOR) {
-            f32x3 color = {color_iter[0], color_iter[1], color_iter[2]};
-
-            f32x3 closest_point = f32x3_clamp(color, cell.min, cell.max);
-            f32 min_distance = f32x3_dot(
-                f32x3_sub(color, closest_point),
-                f32x3_sub(color, closest_point)
-            );
-
-            // Otherwise this color is not worth looking into: a better candidate for any point
-            // inside the current cell is the one which had "best_max_distance" distance in the
-            // worst case.
-            if (min_distance <= best_max_distance) {
-                candidates->colors[candidates->count++] = (IndexedColor){
-                    .color = color,
-                    .color_index = color_index,
-                };
-            }
-
-            color_iter += COMPONENTS_PER_COLOR;
-            color_index += 1;
-        }
-
-        arena_rewind(arena, snapshot);
-        cell_candidates[cell_index] =
-            arena_alloc(arena, sizeof(ColorCandidates) + candidates->count * sizeof(IndexedColor));
     }
 
     f32 const *pixel_iter = pixels;
     GifColorIndex *indexed_pixel_iter = indexed_pixels;
     while (pixel_iter != pixels + pixel_count * COMPONENTS_PER_COLOR) {
         f32x3 pixel = {pixel_iter[0], pixel_iter[1], pixel_iter[2]};
-
-        // If a pixel falls outside of the palette bounding box, look through the candidates of a
-        // clamped point. I'm not exactly sure, but I think there is no way a closer color could be
-        // found among the candidates from the neighboring cells (or any other cells).
-        isize cell_x =
-            isize_clamp((pixel.x - color_box.min.x) / color_cell_size.x, 0, GRID_SIZE - 1);
-        isize cell_y =
-            isize_clamp((pixel.y - color_box.min.y) / color_cell_size.y, 0, GRID_SIZE - 1);
-        isize cell_z =
-            isize_clamp((pixel.z - color_box.min.z) / color_cell_size.z, 0, GRID_SIZE - 1);
-
-        isize cell_index = cell_x + cell_y * GRID_SIZE + cell_z * GRID_SIZE * GRID_SIZE;
-
-        GifColorIndex nearest_color_index;
-        f32 distance_to_nearest = INFINITY;
-
-        ColorCandidates *candidates = cell_candidates[cell_index];
-        for (isize i = 0; i < candidates->count; i += 1) {
-            IndexedColor candidate = candidates->colors[i];
-            f32 distance = f32x3_dot(
-                f32x3_sub(candidate.color, pixel),
-                f32x3_sub(candidate.color, pixel)
-            );
-
-            if (distance < distance_to_nearest) {
-                distance_to_nearest = distance;
-                nearest_color_index = candidate.color_index;
-            }
-        }
-
-        *indexed_pixel_iter = nearest_color_index;
+        *indexed_pixel_iter = color_table_get_closest(table, pixel).index;
 
         pixel_iter += COMPONENTS_PER_COLOR;
         indexed_pixel_iter += 1;
+    }
+
+    arena_rewind(arena, snapshot);
+    return indexed_pixels;
+}
+
+GifColorIndex *image_floyd_steinberg_dither(
+    f32 const *image, isize width, isize height,
+    f32 const *colors, isize color_count,
+    void *arena
+) {
+    assert(0 < color_count && color_count <= (isize)GIF_COLOR_INDEX_MAX + 1);
+
+    GifColorIndex *indexed_pixels = arena_alloc(arena, width * height * sizeof(GifColorIndex));
+    if (indexed_pixels == NULL) {
+        return NULL;
+    }
+
+    ArenaSnapshot snapshot = arena_snapshot(arena);
+
+    // Copy input image into a separate array, because we gonna be modifying the input pixels.
+    f32x3 *pixels = arena_alloc(arena, width * height * sizeof(f32x3));
+    if (pixels == NULL) {
+        return NULL;
+    }
+    {
+        f32 const *image_pixel_iter = image;
+        for (isize i = 0; i < width * height; i += 1) {
+            pixels[i] = (f32x3){image_pixel_iter[0], image_pixel_iter[1], image_pixel_iter[2]};
+            image_pixel_iter += COMPONENTS_PER_COLOR;
+        }
+    }
+
+    ColorTable *table = color_table_create(colors, color_count, arena);
+    if (table == NULL) {
+        return NULL;
+    }
+
+    // Limit error diffusion with an arbitrary value of 5% of the color palette bounding box span.
+    f32xbox const error_clamp = {
+        .min = f32x3_scale(f32x3_sub(table->bounding_box.min, table->bounding_box.max), 0.05F),
+        .max = f32x3_scale(f32x3_sub(table->bounding_box.max, table->bounding_box.min), 0.05F),
+    };
+
+    // Limit the pixel values. I'm not sure if it's even necessary to clamp the pixel values.
+    f32xbox const pixel_clamp = {
+        .min = f32x3_add(table->bounding_box.min, error_clamp.min),
+        .max = f32x3_add(table->bounding_box.max, error_clamp.max),
+    };
+
+    for (isize y = 0; y < height; y += 1) {
+        for (isize x = 0; x < width; x += 1) {
+            f32x3 current_color = pixels[y * width + x];
+            IndexedColor closest = color_table_get_closest(table, current_color);
+
+            indexed_pixels[y * width + x] = closest.index;
+
+            f32x3 error = f32x3_clamp(
+                f32x3_sub(current_color, closest.color),
+                error_clamp.min, error_clamp.max
+            );
+
+            if (x + 1 < width) {
+                pixels[y * width + (x + 1)] = f32x3_clamp(
+                    f32x3_add(pixels[y * width + (x + 1)], f32x3_scale(error, 7.0F / 16.0F)),
+                    pixel_clamp.min, pixel_clamp.max
+                );
+            }
+
+            if (x - 1 >= 0 && y + 1 < height) {
+                pixels[(y + 1) * width + (x - 1)] = f32x3_clamp(
+                    f32x3_add(pixels[(y + 1) * width + (x - 1)], f32x3_scale(error, 3.0F / 16.0F)),
+                    pixel_clamp.min, pixel_clamp.max
+                );
+            }
+
+            if (y + 1 < height) {
+                pixels[(y + 1) * width + x] = f32x3_clamp(
+                    f32x3_add(pixels[(y + 1) * width + x], f32x3_scale(error, 5.0F / 16.0F)),
+                    pixel_clamp.min, pixel_clamp.max
+                );
+            }
+
+            if (x + 1 < width && y + 1 < height) {
+                pixels[(y + 1) * width + (x + 1)] = f32x3_clamp(
+                    f32x3_add(pixels[(y + 1) * width + (x + 1)], f32x3_scale(error, 1.0F / 16.0F)),
+                    pixel_clamp.min, pixel_clamp.max
+                );
+            }
+        }
     }
 
     arena_rewind(arena, snapshot);

@@ -191,8 +191,14 @@ u8 *palette_by_octree(
 
 // Prepare an image to be fed into the GIF encoder.
 
-GifColorIndex *image_quantize_for_gif(
+GifColorIndex *image_quantize(
     f32 const *pixels, isize pixel_count,
+    f32 const *colors, isize color_count,
+    void *arena
+);
+
+GifColorIndex *image_floyd_steinberg_dither(
+    f32 const *image, isize width, isize height,
     f32 const *colors, isize color_count,
     void *arena
 );

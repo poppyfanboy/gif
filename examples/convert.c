@@ -6,6 +6,7 @@
 //        [-palette (web-safe|monochrome|black-white|<file>)]
 //        [-palette-gen (median-cut|k-means|k-means++|modified-median-cut|octree)]
 //        [-color-count <generated palette color count>]
+//        [-dither (floyd-steinberg)]
 
 #include <stdlib.h>     // malloc, free, strtoll, abort
 #include <stddef.h>     // size_t, NULL
@@ -85,6 +86,7 @@ int main(int arg_count, char **args) {
 
     ColorSpace color_space = SRGB;
     enum { WEB_SAFE, MONOCHROME, BLACK_WHITE, GENERATE, FROM_FILE } palette = GENERATE;
+
     enum {
         MEDIAN_CUT,
         K_MEANS,
@@ -94,6 +96,8 @@ int main(int arg_count, char **args) {
     } palette_gen = MEDIAN_CUT;
     char const *palette_file_name = NULL;
     isize max_color_count = 256;
+
+    enum { DITHER_NONE, FLOYD_STEINBERG } dither = DITHER_NONE;
 
     for (isize i = 1; i < arg_count; i += 1) {
         if (strcmp(args[i], "-i") == 0 && i + 1 < arg_count) {
@@ -161,6 +165,15 @@ int main(int arg_count, char **args) {
                 palette_gen = OCTREE;
             } else {
                 fprintf(stderr, "Invalid palette generation method: '%s'\n", palette_gen_arg);
+                return 1;
+            }
+        } else if (strcmp(args[i], "-dither") == 0 && i + 1 < arg_count) {
+            char *dither_arg = args[++i];
+
+            if (strcmp(dither_arg, "floyd-steinberg") == 0) {
+                dither = FLOYD_STEINBERG;
+            } else {
+                fprintf(stderr, "Invalid dithering method: '%s'\n", dither_arg);
                 return 1;
             }
         } else {
@@ -300,11 +313,24 @@ int main(int arg_count, char **args) {
 
     // Quantize the image using the picked color palette.
 
-    GifColorIndex *indexed_pixels = image_quantize_for_gif(
-        pixels, image_width * image_height,
-        colors, color_count,
-        &arena
-    );
+    GifColorIndex *indexed_pixels;
+    switch (dither) {
+    case DITHER_NONE: {
+        indexed_pixels = image_quantize(
+            pixels, image_width * image_height,
+            colors, color_count,
+            &arena
+        );
+    } break;
+
+    case FLOYD_STEINBERG: {
+        indexed_pixels = image_floyd_steinberg_dither(
+            pixels, image_width, image_height,
+            colors, color_count,
+            &arena
+        );
+    } break;
+    }
 
     // Encode the GIF.
 
