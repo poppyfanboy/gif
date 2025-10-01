@@ -6,7 +6,7 @@
 //        [-palette (web-safe|monochrome|black-white|<file>)]
 //        [-palette-gen (median-cut|k-means|k-means++|modified-median-cut|octree)]
 //        [-color-count <generated palette color count>]
-//        [-dither (floyd-steinberg)]
+//        [-dither (floyd-steinberg|ordered)]
 
 #include <stdlib.h>     // malloc, free, strtoll, abort
 #include <stddef.h>     // size_t, NULL
@@ -97,7 +97,7 @@ int main(int arg_count, char **args) {
     char const *palette_file_name = NULL;
     isize max_color_count = 256;
 
-    enum { DITHER_NONE, FLOYD_STEINBERG } dither = DITHER_NONE;
+    enum { DITHER_NONE, FLOYD_STEINBERG, ORDERED } dither = DITHER_NONE;
 
     for (isize i = 1; i < arg_count; i += 1) {
         if (strcmp(args[i], "-i") == 0 && i + 1 < arg_count) {
@@ -172,6 +172,8 @@ int main(int arg_count, char **args) {
 
             if (strcmp(dither_arg, "floyd-steinberg") == 0) {
                 dither = FLOYD_STEINBERG;
+            } else if (strcmp(dither_arg, "ordered") == 0) {
+                dither = ORDERED;
             } else {
                 fprintf(stderr, "Invalid dithering method: '%s'\n", dither_arg);
                 return 1;
@@ -325,6 +327,14 @@ int main(int arg_count, char **args) {
 
     case FLOYD_STEINBERG: {
         indexed_pixels = image_floyd_steinberg_dither(
+            pixels, image_width, image_height,
+            colors, color_count,
+            &arena
+        );
+    } break;
+
+    case ORDERED: {
+        indexed_pixels = image_ordered_dither(
             pixels, image_width, image_height,
             colors, color_count,
             &arena

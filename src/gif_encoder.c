@@ -136,6 +136,14 @@ static inline bool isize_power_of_two(isize value) {
     return (value & (value - 1)) == 0;
 }
 
+static inline f32 f32_min(f32 left, f32 right) {
+    return left < right ? left : right;
+}
+
+static inline f32 f32_max(f32 left, f32 right) {
+    return left > right ? left : right;
+}
+
 typedef struct {
     f32 x;
     f32 y;
@@ -193,6 +201,18 @@ static inline f32x3 f32x3_clamp(f32x3 value, f32x3 min, f32x3 max) {
     if (value.z > max.z) { value.z = max.z; }
 
     return value;
+}
+
+static int f32x3_compare_by_x(void const *left, void const *right) {
+    return (int)copysignf(1.0F, ((f32x3 *)left)->x - ((f32x3 *)right)->x);
+}
+
+static int f32x3_compare_by_y(void const *left, void const *right) {
+    return (int)copysignf(1.0F, ((f32x3 *)left)->y - ((f32x3 *)right)->y);
+}
+
+static int f32x3_compare_by_z(void const *left, void const *right) {
+    return (int)copysignf(1.0F, ((f32x3 *)left)->z - ((f32x3 *)right)->z);
 }
 
 #define ARENA_ALIGNMENT 16
@@ -891,18 +911,6 @@ u8 *colors_unique_inplace(u8 *colors, isize color_count, isize *unique_color_cou
     return color_set.colors[0];
 }
 
-static int f32x3_compare_by_x(void const *left, void const *right) {
-    return (int)copysignf(1.0F, ((f32x3 *)left)->x - ((f32x3 *)right)->x);
-}
-
-static int f32x3_compare_by_y(void const *left, void const *right) {
-    return (int)copysignf(1.0F, ((f32x3 *)left)->y - ((f32x3 *)right)->y);
-}
-
-static int f32x3_compare_by_z(void const *left, void const *right) {
-    return (int)copysignf(1.0F, ((f32x3 *)left)->z - ((f32x3 *)right)->z);
-}
-
 f32 *palette_by_median_cut(
     f32 const *colors_raw, isize color_count,
     isize target_color_count,
@@ -1284,7 +1292,7 @@ f32 *palette_by_k_means(
     return palette;
 }
 
-static inline u8 *palette_by_modified_median_cut_impl(
+u8 *palette_by_modified_median_cut(
     u8 const *colors, isize color_count,
     isize target_color_count,
     isize *colors_generated,
@@ -1296,6 +1304,7 @@ static inline u8 *palette_by_modified_median_cut_impl(
 
     u8 *palette = arena_alloc(arena, target_color_count * COMPONENTS_PER_COLOR * sizeof(u8));
     if (palette == NULL) {
+        *colors_generated = 0;
         return NULL;
     }
 
@@ -1305,6 +1314,7 @@ static inline u8 *palette_by_modified_median_cut_impl(
     isize quantized_color_count = (isize)(1 << QUANT) * (1 << QUANT) * (1 << QUANT);
     isize *color_frequencies = arena_alloc(arena, quantized_color_count * sizeof(isize));
     if (color_frequencies == NULL) {
+        *colors_generated = 0;
         return NULL;
     }
 
@@ -1346,6 +1356,7 @@ static inline u8 *palette_by_modified_median_cut_impl(
         .capacity = target_color_count,
     };
     if (queue.boxes == NULL) {
+        *colors_generated = 0;
         return NULL;
     }
     queue.boxes[0] = (Box){
@@ -1357,6 +1368,7 @@ static inline u8 *palette_by_modified_median_cut_impl(
 
     isize *box_plane_frequencies = arena_alloc(arena, (1 << QUANT) * sizeof(isize));
     if (box_plane_frequencies == NULL) {
+        *colors_generated = 0;
         return NULL;
     }
 
@@ -1626,28 +1638,6 @@ static inline u8 *palette_by_modified_median_cut_impl(
     palette = arena_alloc(arena, queue.total_count * COMPONENTS_PER_COLOR * sizeof(u8));
     *colors_generated = queue.total_count;
 
-    return palette;
-}
-
-u8 *palette_by_modified_median_cut(
-    u8 const *colors, isize color_count,
-    isize target_color_count,
-    isize *colors_generated,
-    void *arena
-) {
-    ArenaSnapshot snapshot = arena_snapshot(arena);
-
-    u8 *palette = palette_by_modified_median_cut_impl(
-        colors, color_count,
-        target_color_count,
-        colors_generated,
-        arena
-    );
-
-    if (palette == NULL) {
-        *colors_generated = 0;
-        arena_rewind(arena, snapshot);
-    }
     return palette;
 }
 
@@ -2068,16 +2058,16 @@ GifColorIndex *image_floyd_steinberg_dither(
 
     ArenaSnapshot snapshot = arena_snapshot(arena);
 
-    // Copy input image into a separate array, because we gonna be modifying the input pixels.
+    // Copy the input image into a separate array, because we will be modifying the input pixels.
     f32x3 *pixels = arena_alloc(arena, width * height * sizeof(f32x3));
     if (pixels == NULL) {
         return NULL;
     }
     {
-        f32 const *image_pixel_iter = image;
+        f32 const *image_iter = image;
         for (isize i = 0; i < width * height; i += 1) {
-            pixels[i] = (f32x3){image_pixel_iter[0], image_pixel_iter[1], image_pixel_iter[2]};
-            image_pixel_iter += COMPONENTS_PER_COLOR;
+            pixels[i] = (f32x3){image_iter[0], image_iter[1], image_iter[2]};
+            image_iter += COMPONENTS_PER_COLOR;
         }
     }
 
@@ -2137,6 +2127,138 @@ GifColorIndex *image_floyd_steinberg_dither(
                     pixel_clamp.min, pixel_clamp.max
                 );
             }
+        }
+    }
+
+    arena_rewind(arena, snapshot);
+    return indexed_pixels;
+}
+
+GifColorIndex *image_ordered_dither(
+    f32 const *image, isize width, isize height,
+    f32 const *colors, isize color_count,
+    void *arena
+) {
+    assert(0 < color_count && color_count <= (isize)GIF_COLOR_INDEX_MAX + 1);
+
+    GifColorIndex *indexed_pixels = arena_alloc(arena, width * height * sizeof(GifColorIndex));
+    if (indexed_pixels == NULL) {
+        return NULL;
+    }
+
+    ArenaSnapshot snapshot = arena_snapshot(arena);
+
+    ColorTable *table = color_table_create(colors, color_count, arena);
+    if (table == NULL) {
+        return NULL;
+    }
+
+    // https://en.wikipedia.org/wiki/Ordered_dithering
+    // Generate the Bayer matrix.
+
+    isize const BAYER_MATRIX_SIZE = 32;
+
+    isize bayer_matrix_initial[4] = {
+        0, 2,
+        3, 1,
+    };
+
+    isize *bayer_matrix = bayer_matrix_initial;
+    isize bayer_matrix_size = 2;
+
+    while (bayer_matrix_size < BAYER_MATRIX_SIZE) {
+        isize next_size = bayer_matrix_size * 2;
+        isize *next_matrix = arena_alloc(arena, next_size * next_size * sizeof(isize));
+        if (next_matrix == NULL) {
+            return NULL;
+        }
+
+        for (isize y = 0; y < bayer_matrix_size; y += 1) {
+            for (isize x = 0; x < bayer_matrix_size; x += 1) {
+                isize previous = 4 * bayer_matrix[y * bayer_matrix_size + x];
+
+                next_matrix[(y                ) * next_size + (x                )] = previous;
+                next_matrix[(y                ) * next_size + (x + next_size / 2)] = previous + 2;
+                next_matrix[(y + next_size / 2) * next_size + (x                )] = previous + 3;
+                next_matrix[(y + next_size / 2) * next_size + (x + next_size / 2)] = previous + 1;
+            }
+        }
+
+        bayer_matrix = next_matrix;
+        bayer_matrix_size = next_size;
+    }
+
+    // Calculate the maximum distance between successive values on each channel in the palette.
+
+    f32x3 *sorted_colors = arena_alloc(arena, color_count * sizeof(f32x3));
+    if (sorted_colors == NULL) {
+        return NULL;
+    }
+    {
+        f32 const *color_iter = colors;
+        for (isize i = 0; i < color_count; i += 1) {
+            sorted_colors[i] = (f32x3){color_iter[0], color_iter[1], color_iter[2]};
+            color_iter += COMPONENTS_PER_COLOR;
+        }
+    }
+
+    f32x3 color_thresholds = {0.0F, 0.0F, 0.0F};
+
+    qsort(sorted_colors, color_count, sizeof(f32x3), f32x3_compare_by_x);
+    for (isize i = 1; i < color_count; i += 1) {
+        color_thresholds.x = f32_max(
+            color_thresholds.x,
+            sorted_colors[i].x - sorted_colors[i - 1].x
+        );
+    }
+
+    qsort(sorted_colors, color_count, sizeof(f32x3), f32x3_compare_by_y);
+    for (isize i = 1; i < color_count; i += 1) {
+        color_thresholds.y = f32_max(
+            color_thresholds.y,
+            sorted_colors[i].y - sorted_colors[i - 1].y
+        );
+    }
+
+    qsort(sorted_colors, color_count, sizeof(f32x3), f32x3_compare_by_z);
+    for (isize i = 1; i < color_count; i += 1) {
+        color_thresholds.z = f32_max(
+            color_thresholds.z,
+            sorted_colors[i].z - sorted_colors[i - 1].z
+        );
+    }
+
+    // Calculate a matrix with color offsets for each component.
+
+    isize const OFFSET_MATRIX_SIZE = BAYER_MATRIX_SIZE;
+    f32x3 *offset_matrix = arena_alloc(
+        arena,
+        OFFSET_MATRIX_SIZE * OFFSET_MATRIX_SIZE * sizeof(f32x3)
+    );
+    if (offset_matrix == NULL) {
+        return NULL;
+    }
+    for (isize i = 0; i < OFFSET_MATRIX_SIZE * OFFSET_MATRIX_SIZE; i += 1) {
+        f32 threshold = (f32)bayer_matrix[i] / (bayer_matrix_size * bayer_matrix_size);
+
+        offset_matrix[i].x = color_thresholds.x * (threshold - 0.5F);
+        offset_matrix[i].y = color_thresholds.y * (threshold - 0.5F);
+        offset_matrix[i].z = color_thresholds.z * (threshold - 0.5F);
+    }
+
+    for (isize y = 0; y < height; y += 1) {
+        for (isize x = 0; x < width; x += 1) {
+            f32x3 current_color = {
+                image[y * (width * COMPONENTS_PER_COLOR) + x * COMPONENTS_PER_COLOR + 0],
+                image[y * (width * COMPONENTS_PER_COLOR) + x * COMPONENTS_PER_COLOR + 1],
+                image[y * (width * COMPONENTS_PER_COLOR) + x * COMPONENTS_PER_COLOR + 2],
+            };
+            f32x3 shifted_color = f32x3_add(
+                current_color,
+                offset_matrix[y % OFFSET_MATRIX_SIZE * OFFSET_MATRIX_SIZE + x % OFFSET_MATRIX_SIZE]
+            );
+
+            indexed_pixels[y * width + x] = color_table_get_closest(table, shifted_color).index;
         }
     }
 

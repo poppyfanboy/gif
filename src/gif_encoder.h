@@ -203,4 +203,10 @@ GifColorIndex *image_floyd_steinberg_dither(
     void *arena
 );
 
+GifColorIndex *image_ordered_dither(
+    f32 const *image, isize width, isize height,
+    f32 const *colors, isize color_count,
+    void *arena
+);
+
 #endif // GIF_ENCODER_H
