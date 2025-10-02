@@ -11,7 +11,7 @@
 
 #include <assert.h> // assert
 #include <stdlib.h> // qsort
-#include <stddef.h> // size_t, NULL
+#include <stddef.h> // NULL
 #include <math.h>   // copysignf, powf, roundf, cbrtf, INFINITY
 #include <string.h> // memmove, memcpy, memset
 
@@ -297,7 +297,7 @@ static void *arena_realloc(Arena *arena, void *old_ptr, isize old_size, isize ne
             return NULL;
         }
 
-        memcpy(new_ptr, old_ptr, (size_t)old_size);
+        memcpy(new_ptr, old_ptr, old_size);
         return new_ptr;
     }
 }
@@ -1003,9 +1003,7 @@ f32 *palette_by_median_cut(
             comparator = f32x3_compare_by_z;
         }
         qsort(
-            current_segment.begin,
-            (size_t)(current_segment.end - current_segment.begin),
-            sizeof(f32x3),
+            current_segment.begin, current_segment.end - current_segment.begin, sizeof(f32x3),
             comparator
         );
 
@@ -1101,93 +1099,94 @@ f32 *palette_by_k_means(
     pcg32_srandom_r(&rng, (u64)memcpy, (u64)memmove);
 
     // Pick the initial set of centroids randomly from the image colors.
-    isize centroid_count = target_color_count;
-    f32x3 *centroids = arena_alloc(arena, centroid_count * sizeof(f32x3));
-    f32x3 *new_centroids = arena_alloc(arena, centroid_count * sizeof(f32x3));
+    f32x3 *centroids = arena_alloc(arena, target_color_count * sizeof(f32x3));
+    f32x3 *new_centroids = arena_alloc(arena, target_color_count * sizeof(f32x3));
     if (centroids == NULL || new_centroids == NULL) {
         *colors_generated = 0;
         return NULL;
     }
 
+    isize centroid_count = 0;
     if (k_means_plus_plus) {
         ArenaSnapshot snapshot = arena_snapshot(arena);
-        f32 *nearest_centroid_distance = arena_alloc(arena, color_count * sizeof(f32x3));
-        if (nearest_centroid_distance == NULL) {
+        f32 *centroid_distances = arena_alloc(arena, color_count * sizeof(f32));
+        if (centroid_distances == NULL) {
             *colors_generated = 0;
             return NULL;
         }
 
-        f32x3 *remaining_colors = colors;
-        f32x3 *centroid_iter = centroids;
-
-        isize first_centroid_index = f64_random(&rng) * (colors_end - remaining_colors);
-        *(centroid_iter++) = remaining_colors[first_centroid_index];
+        // Choose the first centroid purely randomly.
         {
-            f32x3 swap = remaining_colors[first_centroid_index];
-            remaining_colors[first_centroid_index] = remaining_colors[0];
-            remaining_colors[0] = swap;
-            remaining_colors += 1;
+            isize centroid_index = f64_random(&rng) * color_count;
+            centroids[0] = colors[centroid_index];
+
+            f32x3 swap = colors[centroid_index];
+            colors[centroid_index] = colors[0];
+            colors[0] = swap;
+
+            centroid_count = 1;
         }
 
+        // Sum of the distances to the closest centroids for the remaining colors.
         f64 centroid_distance_sum = 0.0;
-        for (isize i = 0; i < colors_end - remaining_colors; i += 1) {
+        for (isize i = centroid_count; i < color_count; i += 1) {
              f32 distance = f32x3_dot(
-                f32x3_sub(centroids[0], remaining_colors[i]),
-                f32x3_sub(centroids[0], remaining_colors[i])
+                f32x3_sub(centroids[0], colors[i]),
+                f32x3_sub(centroids[0], colors[i])
             );
-            nearest_centroid_distance[i] = distance;
+            centroid_distances[i] = distance;
             centroid_distance_sum += distance;
         }
 
-        while (centroid_iter - centroids < target_color_count) {
-            isize next_centroid_index;
-            f32x3 next_centroid;
+        while (centroid_count < target_color_count) {
+            isize centroid_index;
+            f32x3 centroid;
             {
                 f64 random = f64_random(&rng) * centroid_distance_sum;
                 f64 running_sum = 0.0;
-                for (isize i = 0; i < colors_end - remaining_colors; i += 1) {
-                    running_sum += nearest_centroid_distance[i];
+
+                // Iterate from "centroid_count" index to skip colors already chosen as centroids.
+                for (isize i = centroid_count; i < color_count; i += 1) {
+                    running_sum += centroid_distances[i];
                     if (running_sum >= random) {
-                        next_centroid_index = i;
-                        next_centroid = remaining_colors[i];
+                        centroid_index = i;
+                        centroid = colors[i];
                         break;
                     }
                 }
             }
 
-            *(centroid_iter++) = next_centroid;
+            centroids[centroid_count] = centroid;
             {
-                f32x3 swap = remaining_colors[next_centroid_index];
-                remaining_colors[next_centroid_index] = remaining_colors[0];
-                remaining_colors[0] = swap;
-
-                remaining_colors += 1;
+                f32 swap = centroid_distances[centroid_index];
+                centroid_distances[centroid_index] = centroid_distances[centroid_count];
+                centroid_distances[centroid_count] = swap;
             }
             {
-                f32 swap = nearest_centroid_distance[next_centroid_index];
-                nearest_centroid_distance[next_centroid_index] = nearest_centroid_distance[0];
-                nearest_centroid_distance[0] = swap;
-
-                nearest_centroid_distance += 1;
+                f32x3 swap = colors[centroid_index];
+                colors[centroid_index] = colors[centroid_count];
+                colors[centroid_count] = swap;
             }
 
-            for (isize i = 0; i < colors_end - remaining_colors; i += 1) {
+            for (isize i = centroid_count; i < color_count; i += 1) {
                 f32 distance = f32x3_dot(
-                    f32x3_sub(remaining_colors[i], next_centroid),
-                    f32x3_sub(remaining_colors[i], next_centroid)
+                    f32x3_sub(colors[i], centroid),
+                    f32x3_sub(colors[i], centroid)
                 );
-                if (distance < nearest_centroid_distance[i]) {
-                    centroid_distance_sum -= nearest_centroid_distance[i] - distance;
-                    nearest_centroid_distance[i] = distance;
+                if (distance < centroid_distances[i]) {
+                    centroid_distance_sum -= centroid_distances[i] - distance;
+                    centroid_distances[i] = distance;
                 }
             }
+
+            centroid_count += 1;
         }
 
         arena_rewind(arena, snapshot);
     } else {
         f32x3 *centroid_iter = centroids;
         f32x3 *color_iter = colors;
-        for (isize i = 0; i < centroid_count; i += 1) {
+        for (isize i = 0; i < target_color_count; i += 1) {
             isize next_color_index = f64_random(&rng) * (colors_end - color_iter);
             assert(next_color_index < colors_end - color_iter);
 
@@ -1198,6 +1197,8 @@ f32 *palette_by_k_means(
             color_iter[next_color_index] = color_iter[0];
             color_iter[0] = swap;
             color_iter += 1;
+
+            centroid_count += 1;
         }
     }
 
@@ -2281,7 +2282,7 @@ GifOutputBuffer *gif_out_buffer_create(isize min_capacity, void *arena) {
     if (out_buffer->data == NULL) {
         return NULL;
     }
-    memset(out_buffer->data, 0, (size_t)capacity);
+    memset(out_buffer->data, 0, capacity);
 
     out_buffer->encoded_size = 0;
     out_buffer->byte_pos = 0;
@@ -2311,7 +2312,7 @@ bool gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, void *
     if (new_buffer == NULL) {
         return false;
     }
-    memset(new_buffer + out_buffer->capacity, 0, (size_t)(new_capacity - out_buffer->capacity));
+    memset(new_buffer + out_buffer->capacity, 0, new_capacity - out_buffer->capacity);
 
     out_buffer->data = new_buffer;
     out_buffer->capacity = new_capacity;
@@ -2325,7 +2326,7 @@ void gif_out_buffer_reset(GifOutputBuffer *out_buffer) {
     isize unencoded_size =
         (out_buffer->byte_pos - out_buffer->encoded_size) +
         (out_buffer->bit_pos == 0 ? 0 : 1);
-    memmove(out_buffer->data, out_buffer->data + out_buffer->encoded_size, (size_t)unencoded_size);
+    memmove(out_buffer->data, out_buffer->data + out_buffer->encoded_size, unencoded_size);
 
     out_buffer->byte_pos -= out_buffer->encoded_size;
     out_buffer->encoded_size = 0;
@@ -2333,7 +2334,7 @@ void gif_out_buffer_reset(GifOutputBuffer *out_buffer) {
     u8 *free_memory_begin =
         out_buffer->data + out_buffer->byte_pos + (out_buffer->bit_pos == 0 ? 0 : 1);
     u8 *free_memory_end = out_buffer->data + out_buffer->capacity;
-    memset(free_memory_begin, 0, (size_t)(free_memory_end - free_memory_begin));
+    memset(free_memory_begin, 0, free_memory_end - free_memory_begin);
 }
 
 typedef isize LzwCode;
