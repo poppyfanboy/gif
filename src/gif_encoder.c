@@ -2059,76 +2059,98 @@ GifColorIndex *image_floyd_steinberg_dither(
 
     ArenaSnapshot snapshot = arena_snapshot(arena);
 
-    // Copy the input image into a separate array, because we will be modifying the input pixels.
-    f32x3 *pixels = arena_alloc(arena, width * height * sizeof(f32x3));
-    if (pixels == NULL) {
-        return NULL;
-    }
-    {
-        f32 const *image_iter = image;
-        for (isize i = 0; i < width * height; i += 1) {
-            pixels[i] = (f32x3){image_iter[0], image_iter[1], image_iter[2]};
-            image_iter += COMPONENTS_PER_COLOR;
-        }
-    }
-
     ColorTable *table = color_table_create(colors, color_count, arena);
     if (table == NULL) {
         return NULL;
     }
 
-    // Limit error diffusion with an arbitrary value of 5% of the color palette bounding box span.
+    f32x3 *sorted_colors = arena_alloc(arena, color_count * sizeof(f32x3));
+    if (sorted_colors == NULL) {
+        return NULL;
+    }
+    {
+        f32 const *color_iter = colors;
+        for (isize i = 0; i < color_count; i += 1) {
+            sorted_colors[i] = (f32x3){color_iter[0], color_iter[1], color_iter[2]};
+            color_iter += COMPONENTS_PER_COLOR;
+        }
+    }
+
+    // Calculate the maximum distance between successive values on each channel in the palette.
+
+    f32x3 color_thresholds = {0.0F, 0.0F, 0.0F};
+    qsort(sorted_colors, color_count, sizeof(f32x3), f32x3_compare_by_x);
+    for (isize i = 1; i < color_count; i += 1) {
+        color_thresholds.x = f32_max(
+            color_thresholds.x, sorted_colors[i].x - sorted_colors[i - 1].x
+        );
+    }
+    qsort(sorted_colors, color_count, sizeof(f32x3), f32x3_compare_by_y);
+    for (isize i = 1; i < color_count; i += 1) {
+        color_thresholds.y = f32_max(
+            color_thresholds.y, sorted_colors[i].y - sorted_colors[i - 1].y
+        );
+    }
+    qsort(sorted_colors, color_count, sizeof(f32x3), f32x3_compare_by_z);
+    for (isize i = 1; i < color_count; i += 1) {
+        color_thresholds.z = f32_max(
+            color_thresholds.z, sorted_colors[i].z - sorted_colors[i - 1].z
+        );
+    }
+
+    // Don't diffuse more than half the max distance between palette colors worth of error.
     f32xbox const error_clamp = {
-        .min = f32x3_scale(f32x3_sub(table->bounding_box.min, table->bounding_box.max), 0.05F),
-        .max = f32x3_scale(f32x3_sub(table->bounding_box.max, table->bounding_box.min), 0.05F),
+        .min = f32x3_scale(color_thresholds, -0.5F),
+        .max = f32x3_scale(color_thresholds,  0.5F),
     };
 
-    // Limit the pixel values. I'm not sure if it's even necessary to clamp the pixel values.
+    // Don't let pixels get too far outside from the palette bounding box.
     f32xbox const pixel_clamp = {
-        .min = f32x3_add(table->bounding_box.min, error_clamp.min),
-        .max = f32x3_add(table->bounding_box.max, error_clamp.max),
+        .min = table->bounding_box.min,
+        .max = table->bounding_box.max,
     };
 
+    // Allocate slightly larger buffers, so not to bother checking for boundary conditions.
+    f32x3 *current_row_errors = arena_alloc(arena, (width + 2) * sizeof(f32x3));
+    f32x3 *next_row_errors    = arena_alloc(arena, (width + 2) * sizeof(f32x3));
+    if (current_row_errors == NULL || next_row_errors == NULL) {
+        return NULL;
+    }
+    memset(current_row_errors, 0, (width + 2) * sizeof(f32x3));
+    memset(next_row_errors,    0, (width + 2) * sizeof(f32x3));
+
+    f32 const *image_iter = image;
     for (isize y = 0; y < height; y += 1) {
         for (isize x = 0; x < width; x += 1) {
-            f32x3 current_color = pixels[y * width + x];
-            IndexedColor closest = color_table_get_closest(table, current_color);
+            f32x3 image_color = {image_iter[0], image_iter[1], image_iter[2]};
 
+            f32x3 current_color = f32x3_add(
+                image_color,
+                f32x3_clamp(current_row_errors[x + 1], error_clamp.min, error_clamp.max)
+            );
+            current_color = f32x3_clamp(current_color, pixel_clamp.min, pixel_clamp.max);
+
+            IndexedColor closest = color_table_get_closest(table, current_color);
             indexed_pixels[y * width + x] = closest.index;
 
-            f32x3 error = f32x3_clamp(
-                f32x3_sub(current_color, closest.color),
-                error_clamp.min, error_clamp.max
-            );
+            f32x3 error = f32x3_sub(current_color, closest.color);
+            current_row_errors[x + 2] =
+                f32x3_add(current_row_errors[x + 2], f32x3_scale(error, 7.0F / 16.0F));
+            next_row_errors[x] =
+                f32x3_add(next_row_errors[x], f32x3_scale(error, 3.0F / 16.0F));
+            next_row_errors[x + 1] =
+                f32x3_add(next_row_errors[x + 1], f32x3_scale(error, 5.0F / 16.0F));
+            next_row_errors[x + 2] =
+                f32x3_add(next_row_errors[x + 2], f32x3_scale(error, 1.0F / 16.0F));
 
-            if (x + 1 < width) {
-                pixels[y * width + (x + 1)] = f32x3_clamp(
-                    f32x3_add(pixels[y * width + (x + 1)], f32x3_scale(error, 7.0F / 16.0F)),
-                    pixel_clamp.min, pixel_clamp.max
-                );
-            }
-
-            if (x - 1 >= 0 && y + 1 < height) {
-                pixels[(y + 1) * width + (x - 1)] = f32x3_clamp(
-                    f32x3_add(pixels[(y + 1) * width + (x - 1)], f32x3_scale(error, 3.0F / 16.0F)),
-                    pixel_clamp.min, pixel_clamp.max
-                );
-            }
-
-            if (y + 1 < height) {
-                pixels[(y + 1) * width + x] = f32x3_clamp(
-                    f32x3_add(pixels[(y + 1) * width + x], f32x3_scale(error, 5.0F / 16.0F)),
-                    pixel_clamp.min, pixel_clamp.max
-                );
-            }
-
-            if (x + 1 < width && y + 1 < height) {
-                pixels[(y + 1) * width + (x + 1)] = f32x3_clamp(
-                    f32x3_add(pixels[(y + 1) * width + (x + 1)], f32x3_scale(error, 1.0F / 16.0F)),
-                    pixel_clamp.min, pixel_clamp.max
-                );
-            }
+            image_iter += COMPONENTS_PER_COLOR;
         }
+
+        f32x3 *swap = current_row_errors;
+        current_row_errors = next_row_errors;
+
+        next_row_errors = swap;
+        memset(next_row_errors, 0, (width + 2) * sizeof(f32x3));
     }
 
     arena_rewind(arena, snapshot);
@@ -2204,28 +2226,22 @@ GifColorIndex *image_ordered_dither(
     }
 
     f32x3 color_thresholds = {0.0F, 0.0F, 0.0F};
-
     qsort(sorted_colors, color_count, sizeof(f32x3), f32x3_compare_by_x);
     for (isize i = 1; i < color_count; i += 1) {
         color_thresholds.x = f32_max(
-            color_thresholds.x,
-            sorted_colors[i].x - sorted_colors[i - 1].x
+            color_thresholds.x, sorted_colors[i].x - sorted_colors[i - 1].x
         );
     }
-
     qsort(sorted_colors, color_count, sizeof(f32x3), f32x3_compare_by_y);
     for (isize i = 1; i < color_count; i += 1) {
         color_thresholds.y = f32_max(
-            color_thresholds.y,
-            sorted_colors[i].y - sorted_colors[i - 1].y
+            color_thresholds.y, sorted_colors[i].y - sorted_colors[i - 1].y
         );
     }
-
     qsort(sorted_colors, color_count, sizeof(f32x3), f32x3_compare_by_z);
     for (isize i = 1; i < color_count; i += 1) {
         color_thresholds.z = f32_max(
-            color_thresholds.z,
-            sorted_colors[i].z - sorted_colors[i - 1].z
+            color_thresholds.z, sorted_colors[i].z - sorted_colors[i - 1].z
         );
     }
 
