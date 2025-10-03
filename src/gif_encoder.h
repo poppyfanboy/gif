@@ -1,5 +1,5 @@
 // Conventions and assumptions:
-//  - Color arrays are assumed to have 3 components per pixel: red, green, blue (in this order).
+//  - Color arrays have either 3 or 4 components per pixel: red, green, blue, alpha (in this order).
 //  - Functions which create or allocate something will return NULL if you run out of memory.
 //  - Use encoder functions only when there is enough free memory left in the output buffer
 //  (see GIF_OUT_BUFFER_MIN_CAPACITY).
@@ -79,7 +79,7 @@ GifEncoder *gif_encoder_create(void *arena);
 void gif_encoder_start(
     GifEncoder *encoder,
     isize width, isize height,
-    u8 const *global_colors, isize global_color_count,
+    u8 const *global_colors, isize global_color_count, int components,
     GifOutputBuffer *out_buffer
 );
 
@@ -94,7 +94,7 @@ typedef u8 GifColorIndex;
 
 void gif_encoder_start_frame(
     GifEncoder *encoder,
-    u8 const *local_colors, isize local_color_count,
+    u8 const *local_colors, isize local_color_count, int components,
     GifOutputBuffer *out_buffer
 );
 
@@ -114,7 +114,7 @@ void gif_encoder_finish_frame(GifEncoder *encoder, GifOutputBuffer *out_buffer);
 // or if we run out of memory in the process.
 bool gif_encode_whole_frame(
     GifEncoder *encoder,
-    u8 const *local_colors, isize color_count,
+    u8 const *local_colors, isize color_count, int components,
     GifColorIndex *pixels,
     GifOutputBuffer *out_buffer
 );
@@ -122,45 +122,53 @@ bool gif_encode_whole_frame(
 
 // Some predefined fixed color sRGB palettes.
 
-u8 *srgb_palette_black_and_white(isize *color_count, void *arena);
-u8 *srgb_palette_monochrome(isize *color_count, void *arena);
-u8 *srgb_palette_web_safe(isize *color_count, void *arena);
+u8 *srgb_palette_black_and_white(isize *color_count, int components, void *arena);
+u8 *srgb_palette_monochrome(isize *color_count, int components, void *arena);
+u8 *srgb_palette_web_safe(isize *color_count, int components, void *arena);
 
 
 // Use these to convert the input image or sRGB palettes into the desired color space.
 // Conversions back into sRGB are needed to put generated color tables into the GIF.
 
-f32 *srgb_to_float(u8 const *srgb_colors, isize color_count, void *arena);
-u8 *float_to_srgb(f32 const *srgb_colors, isize color_count, void *arena);
+f32 *srgb_to_float(u8  const *srgb_colors, isize color_count, int components, void *arena);
+u8  *float_to_srgb(f32 const *srgb_colors, isize color_count, int components, void *arena);
 
-f32 *srgb_to_linear(u8 const *srgb_colors, isize color_count, void *arena);
-u8 *linear_to_srgb(f32 const *linear_colors, isize color_count, void *arena);
+f32 *srgb_to_linear(u8  const *srgb_colors,   isize color_count, int components, void *arena);
+u8  *linear_to_srgb(f32 const *linear_colors, isize color_count, int components, void *arena);
 
-f32 *srgb_to_lab(u8 const *srgb_colors, isize color_count, void *arena);
-u8 *lab_to_srgb(f32 const *lab_colors, isize color_count, void *arena);
+f32 *srgb_to_lab(u8  const *srgb_colors, isize color_count, int components, void *arena);
+u8  *lab_to_srgb(f32 const *lab_colors,  isize color_count, int components, void *arena);
 
-f32 *srgb_to_oklab(u8 const *srgb_colors, isize color_count, void *arena);
-u8 *oklab_to_srgb(f32 const *oklab_colors, isize color_count, void *arena);
+f32 *srgb_to_oklab(u8  const *srgb_colors,  isize color_count, int components, void *arena);
+u8  *oklab_to_srgb(f32 const *oklab_colors, isize color_count, int components, void *arena);
 
 
 // Generate a custom color palette that best fits the given image.
 // Less colors passed to the palette generation algorithm the faster it works. Palette quality will
 // differ depending on the specific algorithm.
 
-u8 *colors_unique(u8 const *colors, isize color_count, isize *unique_color_count, void *arena);
+u8 *colors_unique(
+    u8 const *colors, isize color_count, int components,
+    isize *unique_color_count,
+    void *arena
+);
 
 // Writes the result directly into the "colors" array. Still needs extra memory for the hash set.
-u8 *colors_unique_inplace(u8 *colors, isize color_count, isize *unique_color_count, void *arena);
+u8 *colors_unique_inplace(
+    u8 *colors, isize color_count, int components,
+    isize *unique_color_count,
+    void *arena
+);
 
 f32 *palette_by_median_cut(
-    f32 const *colors, isize color_count,
+    f32 const *colors, isize color_count, int components,
     isize target_color_count,
     isize *colors_generated,
     void *arena
 );
 
 f32 *palette_by_k_means(
-    f32 const *colors, isize color_count,
+    f32 const *colors, isize color_count, int components,
     isize target_color_count,
     isize *colors_generated,
     bool k_means_plus_plus,
@@ -172,7 +180,7 @@ f32 *palette_by_k_means(
 //  - http://leptonica.org/papers/mediancut.pdf
 //  - https://tpgit.github.io/Leptonica/colorquant2_8c.html
 u8 *palette_by_modified_median_cut(
-    u8 const *colors, isize color_count,
+    u8 const *colors, isize color_count, int components,
     isize target_color_count,
     isize *colors_generated,
     void *arena
@@ -182,7 +190,7 @@ u8 *palette_by_modified_median_cut(
 //  - https://www.cubic.org/docs/octree.htm
 //  - https://observablehq.com/@tmcw/octree-color-quantization
 u8 *palette_by_octree(
-    u8 const *colors, isize color_count,
+    u8 const *colors, isize color_count, int components,
     isize target_color_count,
     isize *colors_generated,
     void *arena
@@ -192,19 +200,19 @@ u8 *palette_by_octree(
 // Prepare an image to be fed into the GIF encoder.
 
 GifColorIndex *image_quantize(
-    f32 const *pixels, isize pixel_count,
+    f32 const *pixels, isize pixel_count, int components,
     f32 const *colors, isize color_count,
     void *arena
 );
 
 GifColorIndex *image_floyd_steinberg_dither(
-    f32 const *image, isize width, isize height,
+    f32 const *image, isize width, isize height, int components,
     f32 const *colors, isize color_count,
     void *arena
 );
 
 GifColorIndex *image_ordered_dither(
-    f32 const *image, isize width, isize height,
+    f32 const *image, isize width, isize height, int components,
     f32 const *colors, isize color_count,
     void *arena
 );

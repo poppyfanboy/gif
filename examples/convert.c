@@ -47,23 +47,31 @@ void arena_report_alloc(void *arena_void, isize size) {
 
 typedef enum { SRGB, LINEAR, LAB, OKLAB } ColorSpace;
 
-f32 *from_srgb(u8 const *srgb_colors, isize color_count, ColorSpace color_space, Arena *arena) {
+f32 *from_srgb(
+    u8 const *srgb_colors, isize color_count, int components,
+    ColorSpace color_space,
+    Arena *arena
+) {
     switch (color_space) {
-    case SRGB:      return srgb_to_float(srgb_colors, color_count, arena);
-    case LINEAR:    return srgb_to_linear(srgb_colors, color_count, arena);
-    case LAB:       return srgb_to_lab(srgb_colors, color_count, arena);
-    case OKLAB:     return srgb_to_oklab(srgb_colors, color_count, arena);
+    case SRGB:      return srgb_to_float(srgb_colors, color_count, components, arena);
+    case LINEAR:    return srgb_to_linear(srgb_colors, color_count, components, arena);
+    case LAB:       return srgb_to_lab(srgb_colors, color_count, components, arena);
+    case OKLAB:     return srgb_to_oklab(srgb_colors, color_count, components, arena);
     }
 
     abort();
 }
 
-u8 *into_srgb(f32 const *colors, isize color_count, ColorSpace color_space, Arena *arena) {
+u8 *into_srgb(
+    f32 const *colors, isize color_count, int components,
+    ColorSpace color_space,
+    Arena *arena
+) {
     switch (color_space) {
-    case SRGB:      return float_to_srgb(colors, color_count, arena);
-    case LINEAR:    return linear_to_srgb(colors, color_count, arena);
-    case LAB:       return lab_to_srgb(colors, color_count, arena);
-    case OKLAB:     return oklab_to_srgb(colors, color_count, arena);
+    case SRGB:      return float_to_srgb(colors, color_count, components, arena);
+    case LINEAR:    return linear_to_srgb(colors, color_count, components, arena);
+    case LAB:       return lab_to_srgb(colors, color_count, components, arena);
+    case OKLAB:     return oklab_to_srgb(colors, color_count, components, arena);
     }
 
     abort();
@@ -209,22 +217,35 @@ int main(int arg_count, char **args) {
     // Read the pixels from the file.
 
     int image_width, image_height;
-    u8 *srgb_pixels = stbi_load(input_file_name, &image_width, &image_height, NULL, 3);
+    int components;
+    u8 *srgb_pixels = stbi_load(input_file_name, &image_width, &image_height, &components, 0);
     if (srgb_pixels == NULL) {
         fprintf(stderr, "Failed to load the input image: '%s'\n", input_file_name);
         return 1;
     }
+    if (components != 3 && components != 4) {
+        fprintf(stderr, "Images with %d color components are not supported.\n", components);
+        return 1;
+    }
 
-    f32 *pixels = from_srgb(srgb_pixels, image_width * image_height, color_space, &arena);
+    f32 *pixels = from_srgb(
+        srgb_pixels, image_width * image_height, components,
+        color_space,
+        &arena
+    );
     isize pixel_count = (isize)image_width * image_height;
 
     isize unique_pixel_count;
     u8 *unique_srgb_pixels = colors_unique_inplace(
-        srgb_pixels, pixel_count,
+        srgb_pixels, pixel_count, components,
         &unique_pixel_count,
         &arena
     );
-    f32 *unique_pixels = from_srgb(unique_srgb_pixels, unique_pixel_count, color_space, &arena);
+    f32 *unique_pixels = from_srgb(
+        unique_srgb_pixels, unique_pixel_count, components,
+        color_space,
+        &arena
+    );
 
     // Pick a color palette.
 
@@ -232,68 +253,68 @@ int main(int arg_count, char **args) {
     u8 *srgb_colors;
     isize color_count;
     if (palette == WEB_SAFE || palette == MONOCHROME || palette == BLACK_WHITE) {
-        typedef u8 *(*PaletteGen)(isize *, void *);
+        typedef u8 *(*PaletteGen)(isize *, int, void *);
         PaletteGen palette_gen = ((PaletteGen[]){
             [WEB_SAFE]      = srgb_palette_web_safe,
             [MONOCHROME]    = srgb_palette_monochrome,
             [BLACK_WHITE]   = srgb_palette_black_and_white,
         })[palette];
 
-        srgb_colors = palette_gen(&color_count, &arena);
-        colors = from_srgb(srgb_colors, color_count, color_space, &arena);
+        srgb_colors = palette_gen(&color_count, components, &arena);
+        colors = from_srgb(srgb_colors, color_count, components, color_space, &arena);
     } else if (palette == GENERATE) {
         switch (palette_gen) {
         case MEDIAN_CUT: {
             colors = palette_by_median_cut(
-                unique_pixels, unique_pixel_count,
+                unique_pixels, unique_pixel_count, components,
                 max_color_count,
                 &color_count,
                 &arena
             );
-            srgb_colors = into_srgb(colors, color_count, color_space, &arena);
+            srgb_colors = into_srgb(colors, color_count, components, color_space, &arena);
         } break;
 
         case K_MEANS: {
             colors = palette_by_k_means(
-                unique_pixels, unique_pixel_count,
+                unique_pixels, unique_pixel_count, components,
                 max_color_count,
                 &color_count,
                 false,
                 &arena
             );
-            srgb_colors = into_srgb(colors, color_count, color_space, &arena);
+            srgb_colors = into_srgb(colors, color_count, components, color_space, &arena);
         } break;
 
         case K_MEANS_PLUS_PLUS: {
             // From my testing k-means++ works better when you don't pick unique colors.
             colors = palette_by_k_means(
-                pixels, pixel_count,
+                pixels, pixel_count, components,
                 max_color_count,
                 &color_count,
                 true,
                 &arena
             );
-            srgb_colors = into_srgb(colors, color_count, color_space, &arena);
+            srgb_colors = into_srgb(colors, color_count, components, color_space, &arena);
         } break;
 
         case MODIFIED_MEDIAN_CUT: {
             srgb_colors = palette_by_modified_median_cut(
-                srgb_pixels, pixel_count,
+                unique_srgb_pixels, unique_pixel_count, components,
                 max_color_count,
                 &color_count,
                 &arena
             );
-            colors = from_srgb(srgb_colors, color_count, color_space, &arena);
+            colors = from_srgb(srgb_colors, color_count, components, color_space, &arena);
         } break;
 
         case OCTREE: {
             srgb_colors = palette_by_octree(
-                unique_srgb_pixels, unique_pixel_count,
+                unique_srgb_pixels, unique_pixel_count, components,
                 max_color_count,
                 &color_count,
                 &arena
             );
-            colors = from_srgb(srgb_colors, color_count, color_space, &arena);
+            colors = from_srgb(srgb_colors, color_count, components, color_space, &arena);
         } break;
         }
     } else if (palette == FROM_FILE) {
@@ -310,7 +331,7 @@ int main(int arg_count, char **args) {
             return 1;
         }
 
-        colors = from_srgb(srgb_colors, color_count, color_space, &arena);
+        colors = from_srgb(srgb_colors, color_count, components, color_space, &arena);
     }
 
     // Quantize the image using the picked color palette.
@@ -319,7 +340,7 @@ int main(int arg_count, char **args) {
     switch (dither) {
     case DITHER_NONE: {
         indexed_pixels = image_quantize(
-            pixels, image_width * image_height,
+            pixels, image_width * image_height, components,
             colors, color_count,
             &arena
         );
@@ -327,7 +348,7 @@ int main(int arg_count, char **args) {
 
     case FLOYD_STEINBERG: {
         indexed_pixels = image_floyd_steinberg_dither(
-            pixels, image_width, image_height,
+            pixels, image_width, image_height, components,
             colors, color_count,
             &arena
         );
@@ -335,7 +356,7 @@ int main(int arg_count, char **args) {
 
     case ORDERED: {
         indexed_pixels = image_ordered_dither(
-            pixels, image_width, image_height,
+            pixels, image_width, image_height, components,
             colors, color_count,
             &arena
         );
@@ -353,12 +374,17 @@ int main(int arg_count, char **args) {
     GifEncoder *encoder = gif_encoder_create(&arena);
     GifOutputBuffer *out_buffer = gif_out_buffer_create(64 * 1024, &arena);
 
-    gif_encoder_start(encoder, image_width, image_height, srgb_colors, color_count, out_buffer);
+    gif_encoder_start(
+        encoder,
+        image_width, image_height,
+        srgb_colors, color_count, components,
+        out_buffer
+    );
     {
         GifColorIndex *indexed_pixel_iter = indexed_pixels;
         GifColorIndex *indexed_pixel_end = indexed_pixels + image_width * image_height;
 
-        gif_encoder_start_frame(encoder, NULL, 0, out_buffer);
+        gif_encoder_start_frame(encoder, NULL, 0, components, out_buffer);
 
         while (indexed_pixel_iter != indexed_pixel_end) {
             indexed_pixel_iter += gif_encoder_feed_frame(
