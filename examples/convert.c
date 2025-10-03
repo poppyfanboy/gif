@@ -319,7 +319,10 @@ int main(int arg_count, char **args) {
         }
     } else if (palette == FROM_FILE) {
         int palette_width, palette_height;
-        srgb_colors = stbi_load(palette_file_name, &palette_width, &palette_height, NULL, 3);
+        srgb_colors = stbi_load(
+            palette_file_name,
+            &palette_width, &palette_height, NULL, components
+        );
         if (srgb_colors == NULL) {
             fprintf(stderr, "Failed to load the file with the palette: '%s'\n", palette_file_name);
             return 1;

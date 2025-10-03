@@ -2189,14 +2189,14 @@ GifColorIndex *image_floyd_steinberg_dither(
 
     // Don't diffuse more than half the max distance between palette colors worth of error.
     f32xbox const error_clamp = {
-        .min = f32x3_scale(color_thresholds, -0.5F),
-        .max = f32x3_scale(color_thresholds,  0.5F),
+        .min = f32x3_scale(color_thresholds, -1.0F),
+        .max = f32x3_scale(color_thresholds,  1.0F),
     };
 
     // Don't let pixels get too far outside from the palette bounding box.
     f32xbox const pixel_clamp = {
-        .min = table->bounding_box.min,
-        .max = table->bounding_box.max,
+        .min = f32x3_add(table->bounding_box.min, f32x3_scale(error_clamp.min, 0.5F)),
+        .max = f32x3_add(table->bounding_box.max, f32x3_scale(error_clamp.max, 0.5F)),
     };
 
     // Allocate slightly larger buffers, so not to bother checking for boundary conditions.
@@ -2880,6 +2880,22 @@ void gif_encoder_start_frame(
     out_buffer->encoded_size = out_iter - out_buffer->data - 1;
     out_buffer->byte_pos = out_iter - out_buffer->data;
     encoder->data_block_begin = 0;
+
+    // Empty the LZW tree.
+
+    LzwTreeNode *root = encoder->lzw_tree.root;
+    memset(root->children, 0, sizeof(root->children));
+
+    if (root != encoder->lzw_tree.last) {
+        encoder->lzw_tree.last->next = encoder->free_lzw_nodes;
+        encoder->lzw_tree.last = root;
+
+        encoder->free_lzw_nodes = root->next;
+        root->next = NULL;
+    }
+
+    encoder->lzw_tree.iter = encoder->lzw_tree.root;
+    encoder->next_lzw_code = LZW_CODE_INVALID;
 
     // Output a clear code because the spec says so:
     // > encoders should output a clear code as the first code of each image data stream.

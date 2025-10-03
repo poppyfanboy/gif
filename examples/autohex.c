@@ -347,7 +347,7 @@ int main(void) {
     image.pixels = arena_alloc(&arena, image.width * image.height);
 
     isize color_count;
-    u8 *colors = srgb_palette_black_and_white(&color_count, &arena);
+    u8 *colors = srgb_palette_black_and_white(&color_count, 3, &arena);
 
     FILE *output_file = fopen("autohex.gif", "wb");
     if (output_file == NULL) {
@@ -381,7 +381,7 @@ int main(void) {
     grid_pong->height = grid_height;
     grid_pong->stride = grid_width;
 
-    gif_encoder_start(encoder, image.width, image.height, colors, color_count, out_buffer);
+    gif_encoder_start(encoder, image.width, image.height, colors, color_count, 3, out_buffer);
     if (gif_out_buffer_capacity_left(out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
         fwrite(out_buffer->data, 1, (size_t)out_buffer->encoded_size, output_file);
         gif_out_buffer_reset(out_buffer);
@@ -421,7 +421,7 @@ int main(void) {
         GifColorIndex *image_iter = image.pixels;
         GifColorIndex *image_end = image.pixels + image.width * image.height;
 
-        gif_encoder_start_frame(encoder, NULL, 0, out_buffer);
+        gif_encoder_start_frame(encoder, NULL, 0, 3, out_buffer);
         if (gif_out_buffer_capacity_left(out_buffer) < GIF_OUT_BUFFER_MIN_CAPACITY) {
             fwrite(out_buffer->data, 1, (size_t)out_buffer->encoded_size, output_file);
             gif_out_buffer_reset(out_buffer);
