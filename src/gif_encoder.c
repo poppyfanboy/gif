@@ -5,11 +5,49 @@
 
 #include "gif_encoder.h"
 
-#include <assert.h> // assert
-#include <stdlib.h> // qsort
-#include <stddef.h> // NULL
-#include <math.h>   // copysignf, powf, roundf, cbrtf, INFINITY
-#include <string.h> // memmove, memcpy, memset
+#ifndef GIF_LIB_WASM
+    #include <assert.h> // assert
+    #include <stdlib.h> // qsort
+    #include <stddef.h> // NULL
+    #include <math.h>   // powf, roundf, cbrtf, INFINITY
+    #include <string.h> // memmove, memcpy, memset
+#else
+    #define INFINITY (1.0 / 0.0)
+    #define assert(expression)
+
+    // Standard library functions imported from JavaScript:
+
+    // Clang has trouble importing functions with the names colliding with the standard library, so
+    // use the f64_* naming in here. Using colliding names in import_name seems to be fine though.
+    __attribute__((import_name("pow"))) f64 f64_pow(f64 base, f64 exponent);
+    __attribute__((import_name("cbrt"))) f64 f64_cbrt(f64 value);
+    __attribute__((import_name("round"))) f64 f64_round(f64 value);
+
+    // Standard library functions hand-rolled later in this file:
+
+    static void *memcpy(void *restrict dest, void const *restrict source, isize count);
+    static void *memmove(void *dest, void const *source, isize count);
+    static void *memset(void *dest, int value, isize count);
+
+    static inline f32 powf(f32 base, f32 exponent) {
+        return f64_pow(base, exponent);
+    }
+
+    static inline f32 cbrtf(f32 value) {
+        return f64_cbrt(value);
+    }
+
+    static inline f32 roundf(f32 value) {
+        return f64_round(value);
+    }
+
+    // Be careful, this is not actually a qsort and also the implementation is hardcoded to only
+    // work for f32x3 passed as elements (element_size gets ignored, see the implementation below).
+    static void qsort(
+        void *elements, isize count, isize element_size,
+        int(*comparator)(void const *, void const *)
+    );
+#endif
 
 // *Really* minimal PCG32 code / (c) 2014 M.E. O'Neill / pcg-random.org
 // Licensed under Apache License 2.0 (NO WARRANTY, etc. see website)
@@ -41,6 +79,12 @@ static f64 f64_random(pcg32_random_t *rng) {
     return (f64)pcg32_random_r(rng) * 0x1p-32;
 }
 
+
+#ifndef GIF_LIB_WASM
+    #define GIF_LIB_DEFINE(name)
+#else
+    #define GIF_LIB_DEFINE(name) __attribute__((export_name(#name)))
+#endif
 
 #define sizeof(expr) (isize)sizeof(expr)
 #define lengthof(string) (sizeof(string) - 1)
@@ -200,15 +244,24 @@ static inline f32x3 f32x3_clamp(f32x3 value, f32x3 min, f32x3 max) {
 }
 
 static int f32x3_compare_by_x(void const *left, void const *right) {
-    return (int)copysignf(1.0F, ((f32x3 *)left)->x - ((f32x3 *)right)->x);
+    f32 difference = ((f32x3 *)left)->x - ((f32x3 *)right)->x;
+    if (difference < 0.0F) { return -1; }
+    if (difference > 0.0F) { return  1; }
+    return 0;
 }
 
 static int f32x3_compare_by_y(void const *left, void const *right) {
-    return (int)copysignf(1.0F, ((f32x3 *)left)->y - ((f32x3 *)right)->y);
+    f32 difference = ((f32x3 *)left)->y - ((f32x3 *)right)->y;
+    if (difference < 0.0F) { return -1; }
+    if (difference > 0.0F) { return  1; }
+    return 0;
 }
 
 static int f32x3_compare_by_z(void const *left, void const *right) {
-    return (int)copysignf(1.0F, ((f32x3 *)left)->z - ((f32x3 *)right)->z);
+    f32 difference = ((f32x3 *)left)->z - ((f32x3 *)right)->z;
+    if (difference < 0.0F) { return -1; }
+    if (difference > 0.0F) { return  1; }
+    return 0;
 }
 
 #define ARENA_ALIGNMENT 16
@@ -298,6 +351,7 @@ static void *arena_realloc(Arena *arena, void *old_ptr, isize old_size, isize ne
     }
 }
 
+GIF_LIB_DEFINE(srgb_palette_black_and_white)
 u8 *srgb_palette_black_and_white(isize *color_count, int components, void *arena) {
     assert(components == 3 || components == 4);
 
@@ -325,6 +379,7 @@ u8 *srgb_palette_black_and_white(isize *color_count, int components, void *arena
     return colors;
 }
 
+GIF_LIB_DEFINE(srgb_palette_monochrome)
 u8 *srgb_palette_monochrome(isize *color_count, int components, void *arena) {
     assert(components == 3 || components == 4);
 
@@ -349,6 +404,7 @@ u8 *srgb_palette_monochrome(isize *color_count, int components, void *arena) {
     return colors;
 }
 
+GIF_LIB_DEFINE(srgb_palette_web_safe)
 u8 *srgb_palette_web_safe(isize *color_count, int components, void *arena) {
     assert(components == 3 || components == 4);
 
@@ -378,6 +434,7 @@ u8 *srgb_palette_web_safe(isize *color_count, int components, void *arena) {
     return colors;
 }
 
+GIF_LIB_DEFINE(srgb_to_float)
 f32 *srgb_to_float(u8 const *srgb_colors, isize color_count, int components, void *arena) {
     f32 *float_colors = arena_alloc(arena, color_count * components * sizeof(f32));
     if (float_colors == NULL) {
@@ -400,6 +457,7 @@ f32 *srgb_to_float(u8 const *srgb_colors, isize color_count, int components, voi
     return float_colors;
 }
 
+GIF_LIB_DEFINE(float_to_srgb)
 u8 *float_to_srgb(f32 const *float_colors, isize color_count, int components, void *arena) {
     u8 *srgb_colors = arena_alloc(arena, color_count * components * sizeof(u8));
     if (srgb_colors == NULL) {
@@ -427,6 +485,7 @@ static inline f32 srgb_component_to_linear(f32 c) {
     return c <= 0.04045F ? c / 12.92F : powf((c + 0.055F) / 1.055F, 2.4F);
 }
 
+GIF_LIB_DEFINE(srgb_to_linear)
 f32 *srgb_to_linear(u8 const *srgb_colors, isize color_count, int components, void *arena) {
     f32 *linear_colors = arena_alloc(arena, color_count * components * sizeof(f32));
     if (linear_colors == NULL) {
@@ -454,6 +513,7 @@ static inline f32 linear_component_to_srgb(f32 c) {
     return c <= 0.0031308F ? 12.92F * c : 1.055F * powf(c, 1.0F / 2.4F) - 0.055F;
 }
 
+GIF_LIB_DEFINE(linear_to_srgb)
 u8 *linear_to_srgb(f32 const *linear_colors, isize color_count, int components, void *arena) {
     u8 *srgb_colors = arena_alloc(arena, color_count * components * sizeof(u8));
     if (srgb_colors == NULL) {
@@ -476,6 +536,7 @@ u8 *linear_to_srgb(f32 const *linear_colors, isize color_count, int components, 
     return srgb_colors;
 }
 
+GIF_LIB_DEFINE(srgb_to_lab)
 f32 *srgb_to_lab(u8 const *srgb_colors, isize color_count, int components, void *arena) {
     f32 *lab_colors = arena_alloc(arena, color_count * components * sizeof(f32));
     if (lab_colors == NULL) {
@@ -542,6 +603,7 @@ f32 *srgb_to_lab(u8 const *srgb_colors, isize color_count, int components, void 
     return lab_colors;
 }
 
+GIF_LIB_DEFINE(lab_to_srgb)
 u8 *lab_to_srgb(f32 const *lab_colors, isize color_count, int components, void *arena) {
     u8 *srgb_colors = arena_alloc(arena, color_count * components * sizeof(u8));
     if (srgb_colors == NULL) {
@@ -601,6 +663,7 @@ u8 *lab_to_srgb(f32 const *lab_colors, isize color_count, int components, void *
 
 // https://en.wikipedia.org/wiki/Oklab_color_space#Conversion_from_sRGB
 // https://bottosson.github.io/posts/oklab/#converting-from-linear-srgb-to-oklab
+GIF_LIB_DEFINE(srgb_to_oklab)
 f32 *srgb_to_oklab(u8 const *srgb_colors, isize color_count, int components, void *arena) {
     f32 *oklab_colors = arena_alloc(arena, color_count * components * sizeof(f32));
     if (oklab_colors == NULL) {
@@ -640,6 +703,7 @@ f32 *srgb_to_oklab(u8 const *srgb_colors, isize color_count, int components, voi
     return oklab_colors;
 }
 
+GIF_LIB_DEFINE(oklab_to_srgb)
 u8 *oklab_to_srgb(f32 const *oklab_colors, isize color_count, int components, void *arena) {
     u8 *srgb_colors = arena_alloc(arena, color_count * components * sizeof(u8));
     if (srgb_colors == NULL) {
@@ -824,6 +888,7 @@ static bool color_set_append(
     return true;
 }
 
+GIF_LIB_DEFINE(colors_unique)
 u8 *colors_unique(
     u8 const *colors, isize color_count, int components,
     isize *unique_color_count,
@@ -887,6 +952,7 @@ u8 *colors_unique(
     return unique_colors;
 }
 
+GIF_LIB_DEFINE(colors_unique_inplace)
 u8 *colors_unique_inplace(
     u8 *colors, isize color_count, int components,
     isize *unique_color_count,
@@ -933,6 +999,7 @@ u8 *colors_unique_inplace(
     return color_set.colors[0];
 }
 
+GIF_LIB_DEFINE(palette_by_median_cut)
 f32 *palette_by_median_cut(
     f32 const *colors_raw, isize color_raw_count, int components,
     isize target_color_count,
@@ -1098,6 +1165,7 @@ f32 *palette_by_median_cut(
     return palette;
 }
 
+GIF_LIB_DEFINE(palette_by_k_means)
 f32 *palette_by_k_means(
     f32 const *colors_raw, isize color_raw_count, int components,
     isize target_color_count,
@@ -1721,6 +1789,7 @@ u8 *palette_by_modified_median_cut(
     return palette;
 }
 
+GIF_LIB_DEFINE(palette_by_octree)
 u8 *palette_by_octree(
     u8 const *colors, isize color_count, int components,
     isize target_color_count,
@@ -2101,6 +2170,7 @@ static IndexedColor color_table_get_closest(ColorTable const *table, f32x3 searc
     return nearest;
 }
 
+GIF_LIB_DEFINE(image_quantize)
 GifColorIndex *image_quantize(
     f32 const *pixels, isize pixel_count, int components,
     f32 const *colors, isize color_count,
@@ -2134,6 +2204,7 @@ GifColorIndex *image_quantize(
     return indexed_pixels;
 }
 
+GIF_LIB_DEFINE(image_floyd_steinberg_dither)
 GifColorIndex *image_floyd_steinberg_dither(
     f32 const *image, isize width, isize height, int components,
     f32 const *colors, isize color_count,
@@ -2249,6 +2320,7 @@ GifColorIndex *image_floyd_steinberg_dither(
     return indexed_pixels;
 }
 
+GIF_LIB_DEFINE(image_ordered_dither)
 GifColorIndex *image_ordered_dither(
     f32 const *image, isize width, isize height, int components,
     f32 const *colors, isize color_count,
@@ -2374,6 +2446,7 @@ GifColorIndex *image_ordered_dither(
     return indexed_pixels;
 }
 
+GIF_LIB_DEFINE(gif_out_buffer_create)
 GifOutputBuffer *gif_out_buffer_create(isize min_capacity, void *arena) {
     isize capacity = min_capacity;
     if (capacity < GIF_OUT_BUFFER_MIN_CAPACITY) {
@@ -2399,10 +2472,12 @@ GifOutputBuffer *gif_out_buffer_create(isize min_capacity, void *arena) {
     return out_buffer;
 }
 
+GIF_LIB_DEFINE(gif_out_buffer_capacity_left)
 isize gif_out_buffer_capacity_left(GifOutputBuffer const *out_buffer) {
     return out_buffer->capacity - out_buffer->byte_pos - (out_buffer->bit_pos == 0 ? 0 : 1);
 }
 
+GIF_LIB_DEFINE(gif_out_buffer_grow)
 bool gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, void *arena) {
     isize new_capacity = isize_max(
         min_capacity,
@@ -2429,6 +2504,7 @@ bool gif_out_buffer_grow(GifOutputBuffer *out_buffer, isize min_capacity, void *
     return true;
 }
 
+GIF_LIB_DEFINE(gif_out_buffer_reset)
 void gif_out_buffer_reset(GifOutputBuffer *out_buffer) {
     isize unencoded_size =
         (out_buffer->byte_pos - out_buffer->encoded_size) +
@@ -2538,6 +2614,7 @@ static bool gif_encoder_init(GifEncoder *encoder, Arena *arena) {
     return true;
 }
 
+GIF_LIB_DEFINE(gif_encoder_create)
 GifEncoder *gif_encoder_create(void *arena) {
     GifEncoder *encoder = arena_alloc(arena, sizeof(GifEncoder));
     if (encoder == NULL) {
@@ -2572,6 +2649,7 @@ static inline isize gif_color_count_round_up(isize color_count) {
     }
 }
 
+GIF_LIB_DEFINE(gif_encoder_start)
 void gif_encoder_start(
     GifEncoder *encoder,
     isize width, isize height,
@@ -2681,6 +2759,7 @@ void gif_encoder_start(
     encoder->global_color_count = global_color_count;
 }
 
+GIF_LIB_DEFINE(gif_frame_delay)
 void gif_frame_delay(GifEncoder *encoder, f32 seconds) {
     encoder->frame_delay = (u16)(roundf(seconds * 100.0F));
     if (encoder->frame_delay == 0) {
@@ -2759,6 +2838,7 @@ static void gif_encoder_write_lzw_code(
     }
 }
 
+GIF_LIB_DEFINE(gif_encoder_start_frame)
 void gif_encoder_start_frame(
     GifEncoder *encoder,
     u8 const *local_colors, isize local_color_count, int components,
@@ -2908,6 +2988,7 @@ void gif_encoder_start_frame(
     );
 }
 
+GIF_LIB_DEFINE(gif_encoder_feed_frame)
 isize gif_encoder_feed_frame(
     GifEncoder *encoder,
     GifColorIndex const *pixels,
@@ -3046,6 +3127,7 @@ isize gif_encoder_feed_frame(
     return pixel_iter - pixels;
 }
 
+GIF_LIB_DEFINE(gif_encoder_finish_frame)
 void gif_encoder_finish_frame(GifEncoder *encoder, GifOutputBuffer *out_buffer) {
     assert(encoder->state == GIF_ENCODER_FRAME_STARTED);
     assert(gif_out_buffer_capacity_left(out_buffer) >= GIF_OUT_BUFFER_MIN_CAPACITY);
@@ -3084,6 +3166,7 @@ void gif_encoder_finish_frame(GifEncoder *encoder, GifOutputBuffer *out_buffer) 
     encoder->state = GIF_ENCODER_READY_FOR_NEXT_FRAME;
 }
 
+GIF_LIB_DEFINE(gif_encode_whole_frame)
 bool gif_encode_whole_frame(
     GifEncoder *encoder,
     u8 const *local_colors, isize local_color_count, int components,
@@ -3131,6 +3214,7 @@ bool gif_encode_whole_frame(
     return true;
 }
 
+GIF_LIB_DEFINE(gif_encoder_finish)
 void gif_encoder_finish(GifEncoder *encoder, GifOutputBuffer *out_buffer) {
     assert(encoder->state == GIF_ENCODER_READY_FOR_NEXT_FRAME);
     assert(gif_out_buffer_capacity_left(out_buffer) >= GIF_OUT_BUFFER_MIN_CAPACITY);
@@ -3143,3 +3227,74 @@ void gif_encoder_finish(GifEncoder *encoder, GifOutputBuffer *out_buffer) {
 
     encoder->state = GIF_ENCODER_IDLE;
 }
+
+#ifdef GIF_LIB_WASM
+
+static void *memcpy(void *restrict dest_void, void const *restrict source_void, isize count) {
+    u8 *dest = dest_void;
+    u8 const *source = source_void;
+
+    for (isize i = 0; i < count; i += 1) {
+        dest[i] = source[i];
+    }
+
+    return dest;
+}
+
+static void *memmove(void *dest_void, void const *source_void, isize count) {
+    u8 *dest = dest_void;
+    u8 const *source = source_void;
+
+    if (source >= dest) {
+        // Copy elements from left to right.
+        for (isize i = 0; i < count; i += 1) {
+            dest[i] = source[i];
+        }
+    } else {
+        // Copy elements from right to left.
+        for (isize i = count - 1; i >= 0; i -= 1) {
+            dest[i] = source[i];
+        }
+    }
+
+    return dest;
+}
+
+static void *memset(void *dest_void, int value, isize count) {
+    u8 *dest = dest_void;
+
+    for (isize i = 0; i < count; i += 1) {
+        dest[i] = (u8)value;
+    }
+
+    return dest;
+}
+
+static void qsort(
+    void *elements_void, isize count, isize element_size,
+    int(*comparator)(void const *, void const *)
+) {
+    f32x3 *elements = elements_void;
+
+    for (isize i = 1; i < count; i += 1) {
+        f32x3 next_element = elements[i];
+
+        isize j = i - 1;
+        while (j >= 0) {
+            if (
+                comparator == f32x3_compare_by_x && elements[j].x <= next_element.x ||
+                comparator == f32x3_compare_by_y && elements[j].y <= next_element.y ||
+                comparator == f32x3_compare_by_z && elements[j].z <= next_element.z
+            ) {
+                break;
+            }
+
+            j -= 1;
+        }
+
+        memmove(&elements[j + 2], &elements[j + 1], (i - (j + 1)) * sizeof(f32x3));
+        elements[j + 1] = next_element;
+    }
+}
+
+#endif // GIF_LIB_WASM
