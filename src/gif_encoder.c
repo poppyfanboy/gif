@@ -299,7 +299,15 @@ static inline isize arena_memory_left(Arena *arena) {
 #ifndef GIF_LIB_REPORT_ALLOC
     #define GIF_LIB_REPORT_ALLOC(arena, size)
 #else
-    void GIF_LIB_REPORT_ALLOC(void *arena, isize size);
+    #ifndef GIF_LIB_WASM
+        void GIF_LIB_REPORT_ALLOC(void *arena, isize size);
+    #else
+        #define STRINGIFY(x) STRINGIFY_IMPL(x)
+        #define STRINGIFY_IMPL(x) #x
+
+        __attribute__((import_name(STRINGIFY(GIF_LIB_REPORT_ALLOC))))
+        void GIF_LIB_REPORT_ALLOC(void *arena, isize size);
+    #endif
 #endif
 
 static void *arena_alloc(Arena *arena, isize size) {
@@ -1436,6 +1444,7 @@ f32 *palette_by_k_means(
     return palette;
 }
 
+GIF_LIB_DEFINE(palette_by_modified_median_cut)
 u8 *palette_by_modified_median_cut(
     u8 const *colors, isize color_count, int components,
     isize target_color_count,

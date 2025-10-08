@@ -4,7 +4,10 @@
 # Un-ignore only the source code folders.
 !src/
 !examples/
+!public/
 
 # Only keep the source code files.
 !*.c
 !*.h
+!*.js
+!*.html
