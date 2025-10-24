@@ -4,11 +4,41 @@
     <head>
         <title>GIF Encoder</title>
         <meta charset="utf-8" />
+        <link rel="stylesheet" href="modern-normalize.css" />
+        <link rel="stylesheet" href="style.css" />
     </head>
 
     <body>
-        <h1>GIF Encoder</h1>
-        <input type="file" id="image-input" autocomplete="off" />
+        <main class="container">
+            <h1>GIF Encoder</h1>
+
+            <div class="app-container">
+                <div class="gif-config">
+                    <span class="gif-config_label">Palette</span>
+                    <select id="palette-select">
+                        <option value="web-safe">Web-safe</option>
+                        <option value="monochrome">Monochrome</option>
+                        <option value="black-white">Black and white</option>
+                    </select>
+
+                    <button id="convert-button" class="gif-config_convert-button">
+                        Convert
+                    </button>
+                </div>
+
+                <div class="image-input-container">
+                    <label class="image-input-drop-zone" id="image-input-drop-zone" for="image-input">
+                        Drop an image here, or click to upload.
+                    </label>
+                    <input type="file" id="image-input" autocomplete="off" accept="image/*" />
+                </div>
+
+                <div class="image-output-container">
+                    <div id="image-output" class="image-output"></div>
+                    <button id="download-button">Download</button>
+                </div>
+            </div>
+        </main>
     </body>
 
     <script type="module" src="main.js"></script>
