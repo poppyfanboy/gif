@@ -78,7 +78,7 @@ const arena = new Arena();
 const wasmModule = await WebAssembly.instantiateStreaming(fetch('gif_encoder.wasm'), {
     env: {
         memory: arena.wasmMemory,
-        reportAlloc: (arenaPointer, size) => {
+        reportAlloc: (_arenaPointer, size) => {
             const padding = ~(arena.begin + 1) & (ALIGNMENT - 1);
             arena.ensure(padding + size);
         },
@@ -126,44 +126,42 @@ const {
 
 const canvas = new OffscreenCanvas(1, 1);
 const context = canvas.getContext('2d', { willReadFrequently: true });
-const imageInputElement = document.getElementById('image-input');
 
-imageInputElement.addEventListener('input', async function() {
-    const file = this.files[0];
+async function fileToImage(file) {
     const fileUrl = URL.createObjectURL(file);
 
-    const imageElement = await new Promise((resolve, reject) => {
-        const imageElement = new Image();
-        imageElement.onload = function() {
+    const image = await new Promise((resolve, _reject) => {
+        const image = new Image();
+        image.onload = function() {
             resolve(this);
         };
-        imageElement.onerror = function() {
+        image.onerror = function() {
             resolve(null);
         };
-        imageElement.src = fileUrl;
+        image.src = fileUrl;
     });
-    if (imageElement == null) {
-        return;
-    }
 
-    canvas.width = imageElement.width;
-    canvas.height = imageElement.height;
-    context.drawImage(imageElement, 0, 0);
+    return image;
+}
+
+function fileToImageData(image) {
+    canvas.width = image.width;
+    canvas.height = image.height;
+    context.drawImage(image, 0, 0);
 
     // The order of bytes in the ImageData is RGBA regardless of the platform endianness.
-    const imageData = context.getImageData(0, 0, imageElement.width, imageElement.height);
+    const imageData = context.getImageData(0, 0, image.width, image.height);
     const components = Math.round(imageData.data.length / imageData.width / imageData.height);
 
-    const image = {
+    return {
         width: imageData.width,
         height: imageData.height,
         components,
         data: imageData.data,
     };
-    processImage(image);
-});
+}
 
-function processImage(image) {
+function imageDataToGif(image, config) {
     const arenaSnapshot = arena.snapshot();
 
     const components = image.components;
@@ -184,9 +182,22 @@ function processImage(image) {
     );
 
     const colorCountPointer = arena.alloc(4);
-    const srgbColors = srgb_palette_web_safe(
-        colorCountPointer, components, arena.pointer
-    );
+
+    let srgbColors;
+    if (config.palette == 'web-safe') {
+        srgbColors = srgb_palette_web_safe(
+            colorCountPointer, components, arena.pointer
+        );
+    } else if (config.palette == 'monochrome') {
+        srgbColors = srgb_palette_monochrome(
+            colorCountPointer, components, arena.pointer
+        );
+    } else if (config.palette == 'black-white') {
+        srgbColors = srgb_palette_black_and_white(
+            colorCountPointer, components, arena.pointer
+        );
+    }
+
     const colorCount = arena.memory.getInt32(colorCountPointer, true);
     const floatColors = srgb_to_float(
         srgbColors, colorCount, components,
@@ -246,7 +257,117 @@ function processImage(image) {
 
     const imageElement = new Image();
     imageElement.src = gifUrl;
-    document.body.append(imageElement);
 
     arena.rewind(arenaSnapshot);
+
+    return imageElement;
 }
+
+class GifConfig {
+    constructor() {
+        this.paletteSelect = document.getElementById('palette-select');
+        this.paletteSelect.value = 'web-safe';
+    }
+
+    get palette() {
+        return this.paletteSelect.value;
+    }
+}
+
+class App {
+    inputImageData = null;
+    convertedImage = null;
+
+    constructor() {
+        this.imageDropZone = document.getElementById('image-input-drop-zone');
+        this.imageFileInput = document.getElementById('image-input');
+        this.imageOutput = document.getElementById('image-output');
+
+        window.addEventListener('drop', (event) => {
+            event.preventDefault();
+            this.imageDropZone.classList.remove('image-input-drop-zone--overlay-visible');
+        });
+
+        window.addEventListener('dragover', (event) => {
+            event.preventDefault();
+        });
+
+        window.addEventListener('dragenter', () => {
+            this.imageDropZone.classList.add('image-input-drop-zone--overlay-visible');
+        });
+
+        this.imageDropZone.addEventListener('drop', async (event) => {
+            const droppedItem = event.dataTransfer.items[0];
+            if (droppedItem.kind != 'file') {
+                return;
+            }
+
+            const image = await fileToImage(droppedItem.getAsFile());
+            if (image == null) {
+                return;
+            }
+
+            this.inputImageData = fileToImageData(image);
+            this.showUploadedImage(image);
+            this.imageFileInput.value = '';
+
+            this.convertedImage?.remove();
+            this.convertedImage = null;
+        });
+
+        this.imageFileInput.addEventListener('change', async () => {
+            if (this.imageFileInput.files.length == 0) {
+                return;
+            }
+
+            const image = await fileToImage(this.imageFileInput.files[0]);
+            if (image == null) {
+                return;
+            }
+
+            this.inputImageData = fileToImageData(image);
+            this.showUploadedImage(image);
+
+            this.convertedImage?.remove();
+            this.convertedImage = null;
+        });
+
+        this.config = new GifConfig();
+
+        const convertButton = document.getElementById('convert-button');
+        convertButton.addEventListener('click', async () => {
+            if (this.inputImageData == null) {
+                return;
+            }
+
+            this.convertedImage = imageDataToGif(this.inputImageData, this.config);
+            this.showConvertedImage(this.convertedImage);
+        });
+
+        const downloadButton = document.getElementById('download-button');
+        downloadButton.addEventListener('click', () => {
+            if (this.convertedImage == null) {
+                return;
+            }
+
+            const anchorElement = document.createElement('a');
+            anchorElement.href = this.convertedImage.src;
+            anchorElement.download = 'image.gif';
+            anchorElement.click();
+        });
+    }
+
+    showUploadedImage(image) {
+        image.classList.add('uploaded-image');
+        this.imageDropZone.innerHTML = '';
+        this.imageDropZone.appendChild(image);
+    }
+
+    showConvertedImage(image) {
+        image.classList.add('converted-image');
+        this.imageOutput.innerHTML = '';
+        this.imageOutput.appendChild(image);
+    }
+}
+
+const app = new App();
