@@ -90,7 +90,6 @@ img {
 
 .image-output-container {
     height: 100%;
-    min-height: 300px;
     display: flex;
     flex-direction: column;
     gap: 1rem;
@@ -103,16 +102,22 @@ img {
 }
 
 .image-output {
+    flex-grow: 1;
     display: grid;
     place-items: center;
     width: 100%;
     grid-area: output;
     border: 1px solid black;
-    height: 100%;
 }
 
-.image-output:has(img) {
-    min-height: auto;
+@media (width < 1200px) {
+    .image-output {
+        min-height: 300px;
+    }
+
+    .image-output:has(img) {
+        min-height: auto;
+    }
 }
 
 /* Image conversion config */
