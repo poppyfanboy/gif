@@ -395,7 +395,12 @@ class App {
 
             this.inputImageData = imageData;
             this.convertedImage = null;
-            this.showConvertedImage(null);
+
+            const imageOutput = document.getElementById('image-output');
+            imageOutput.style.aspectRatio = `${imageData.width} / ${imageData.height}`;
+
+            const imageOutputPreview = document.getElementById('image-output-preview');
+            imageOutputPreview.style.backgroundImage = null;
         });
 
         this.config = new GifConfig();
@@ -427,13 +432,8 @@ class App {
         const preview = document.getElementById('image-output-preview');
         const imageOutput = document.getElementById('image-output');
 
-        if (image != null) {
-            preview.style.backgroundImage = `url(${image.src})`;
-            imageOutput.style.aspectRatio = `${image.width} / ${image.height}`;
-        } else {
-            preview.style.backgroundImage = null;
-            imageOutput.style.aspectRatio = '2 / 1';
-        }
+        preview.style.backgroundImage = `url(${image.src})`;
+        imageOutput.style.aspectRatio = `${image.width} / ${image.height}`;
     }
 }
 
