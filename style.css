@@ -51,41 +51,6 @@ img {
     }
 }
 
-/* Image input */
-
-.image-input-container {
-    grid-area: input;
-    display: flex;
-    flex-direction: column;
-    align-items: start;
-    gap: 1rem;
-}
-
-.image-input-drop-zone {
-    cursor: pointer;
-    position: relative;
-    display: grid;
-    place-items: center;
-    width: 100%;
-    min-height: 300px;
-    border: solid 1px black;
-}
-
-.image-input-drop-zone--overlay-visible::after {
-    content: "Drop an image here.";
-    position: absolute;
-    width: 100%;
-    height: 100%;
-    display: grid;
-    place-items: center;
-    background-color: black;
-    color: white;
-}
-
-.image-input-drop-zone:has(img) {
-    min-height: auto;
-}
-
 /* Image output */
 
 .image-output-container {
@@ -112,11 +77,11 @@ img {
 
 @media (width < 1200px) {
     .image-output {
-        min-height: 300px;
+        aspect-ratio: 2 / 1;
     }
 
     .image-output:has(img) {
-        min-height: auto;
+        aspect-ratio: auto;
     }
 }
 

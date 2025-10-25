@@ -263,6 +263,115 @@ function imageDataToGif(image, config) {
     return imageElement;
 }
 
+document.addEventListener('dragover', (event) => {
+    event.preventDefault();
+});
+
+document.addEventListener('drop', (event) => {
+    event.preventDefault();
+});
+
+class ImageInput extends HTMLElement {
+    constructor() {
+        super();
+
+        const shadowRoot = this.attachShadow({ mode: 'open' });
+        const template = document.getElementById('image-input-template')
+        shadowRoot.appendChild(template.content.cloneNode(true));
+    }
+
+    connectedCallback() {
+        const overlay = this.shadowRoot.querySelector('.overlay');
+
+        document.addEventListener('drop', () => {
+            overlay.classList.remove('overlay--visible');
+            overlay.classList.remove('overlay--active');
+        });
+
+        document.addEventListener('dragenter', (event) => {
+            if (event.relatedTarget == null) {
+                overlay.classList.add('overlay--visible');
+            }
+        });
+
+        document.addEventListener('dragleave', (event) => {
+            if (event.relatedTarget == null) {
+                overlay.classList.remove('overlay--visible');
+                overlay.classList.remove('overlay--active');
+            }
+        });
+
+        const dropZone = this.shadowRoot.querySelector('.drop-zone');
+
+        dropZone.addEventListener('dragenter', () => {
+            overlay.classList.add('overlay--active');
+        });
+
+        dropZone.addEventListener('dragleave', (event) => {
+            if (event.relatedTarget == null || !dropZone.contains(event.relatedTarget)) {
+                overlay.classList.remove('overlay--active');
+            }
+        });
+
+        const fileInput = this.shadowRoot.querySelector('input');
+
+        dropZone.addEventListener('drop', async (event) => {
+            const droppedItem = event.dataTransfer.items[0];
+            if (droppedItem.kind != 'file') {
+                return;
+            }
+
+            const image = await fileToImage(droppedItem.getAsFile());
+            if (image == null) {
+                return;
+            }
+
+            const imageData = fileToImageData(image);
+
+            fileInput.value = '';
+            this.showUploadedImage(image);
+
+            const changeEvent = new CustomEvent('change', {
+                composed: true,
+                detail: { image, imageData },
+            });
+            this.shadowRoot.dispatchEvent(changeEvent);
+        });
+
+        fileInput.addEventListener('change', async () => {
+            if (fileInput.files.length == 0) {
+                return;
+            }
+
+            const image = await fileToImage(fileInput.files[0]);
+            if (image == null) {
+                return;
+            }
+
+            const imageData = fileToImageData(image);
+
+            fileInput.value = '';
+            this.showUploadedImage(image);
+
+            const changeEvent = new CustomEvent('change', {
+                composed: true,
+                detail: { image, imageData },
+            });
+            this.shadowRoot.dispatchEvent(changeEvent);
+        });
+    }
+
+    showUploadedImage(image) {
+        const preview = this.shadowRoot.querySelector('.preview');
+        preview.style.backgroundImage = `url('${image.src}')`;
+
+        const dropZone = this.shadowRoot.querySelector('.drop-zone');
+        dropZone.style.aspectRatio = `${image.width} / ${image.height}`;
+    }
+}
+
+customElements.define('image-input', ImageInput);
+
 class GifConfig {
     constructor() {
         this.paletteSelect = document.getElementById('palette-select');
@@ -279,58 +388,15 @@ class App {
     convertedImage = null;
 
     constructor() {
-        this.imageDropZone = document.getElementById('image-input-drop-zone');
-        this.imageFileInput = document.getElementById('image-input');
+        const imageInput = document.querySelector('image-input');
+        imageInput.addEventListener('change', (event) => {
+            const { imageData } = event.detail;
+
+            this.inputImageData = imageData;
+            this.convertedImage?.remove();
+        });
+
         this.imageOutput = document.getElementById('image-output');
-
-        window.addEventListener('drop', (event) => {
-            event.preventDefault();
-            this.imageDropZone.classList.remove('image-input-drop-zone--overlay-visible');
-        });
-
-        window.addEventListener('dragover', (event) => {
-            event.preventDefault();
-        });
-
-        window.addEventListener('dragenter', () => {
-            this.imageDropZone.classList.add('image-input-drop-zone--overlay-visible');
-        });
-
-        this.imageDropZone.addEventListener('drop', async (event) => {
-            const droppedItem = event.dataTransfer.items[0];
-            if (droppedItem.kind != 'file') {
-                return;
-            }
-
-            const image = await fileToImage(droppedItem.getAsFile());
-            if (image == null) {
-                return;
-            }
-
-            this.inputImageData = fileToImageData(image);
-            this.showUploadedImage(image);
-            this.imageFileInput.value = '';
-
-            this.convertedImage?.remove();
-            this.convertedImage = null;
-        });
-
-        this.imageFileInput.addEventListener('change', async () => {
-            if (this.imageFileInput.files.length == 0) {
-                return;
-            }
-
-            const image = await fileToImage(this.imageFileInput.files[0]);
-            if (image == null) {
-                return;
-            }
-
-            this.inputImageData = fileToImageData(image);
-            this.showUploadedImage(image);
-
-            this.convertedImage?.remove();
-            this.convertedImage = null;
-        });
 
         this.config = new GifConfig();
 
@@ -355,12 +421,6 @@ class App {
             anchorElement.download = 'image.gif';
             anchorElement.click();
         });
-    }
-
-    showUploadedImage(image) {
-        image.classList.add('uploaded-image');
-        this.imageDropZone.innerHTML = '';
-        this.imageDropZone.appendChild(image);
     }
 
     showConvertedImage(image) {

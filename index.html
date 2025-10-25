@@ -26,12 +26,7 @@
                     </button>
                 </div>
 
-                <div class="image-input-container">
-                    <label class="image-input-drop-zone" id="image-input-drop-zone" for="image-input">
-                        Drop an image here, or click to upload.
-                    </label>
-                    <input type="file" id="image-input" autocomplete="off" accept="image/*" />
-                </div>
+                <image-input></image-input>
 
                 <div class="image-output-container">
                     <div id="image-output" class="image-output"></div>
@@ -39,7 +34,74 @@
                 </div>
             </div>
         </main>
-    </body>
 
-    <script type="module" src="main.js"></script>
+        <template id="image-input-template">
+            <style>
+                @import url('modern-normalize.css');
+
+                .root {
+                    display: flex;
+                    flex-direction: column;
+                    align-items: start;
+                    gap: 1rem;
+                }
+
+                .drop-zone {
+                    position: relative;
+                    width: 100%;
+                    aspect-ratio: 2 / 1;
+                    border: solid 1px black;
+
+                    display: grid;
+                    place-items: center;
+
+                    cursor: pointer;
+                }
+
+                .overlay {
+                    position: absolute;
+                    inset: 0;
+
+                    display: grid;
+                    place-items: center;
+
+                    opacity: 0;
+
+                    background-color: black;
+                    color: white;
+                }
+
+                .overlay--visible {
+                    opacity: 1;
+                }
+
+                .overlay--active::after {
+                    position: absolute;
+                    inset: 1rem;
+                    border: 3px dashed white;
+
+                    content: "";
+                }
+
+                .preview {
+                    position: absolute;
+                    inset: 0;
+                    background-size: cover;
+                    background-repeat: no-repeat;
+                    background-position: center;
+                }
+            </style>
+
+            <div class="root">
+                <label class="drop-zone" for="input">
+                    <span>Drop an image here, or click to upload.</span>
+                    <div class="preview"></div>
+                    <div class="overlay">Drop an image here.</div>
+                </label>
+                <input type="file" autocomplete="off" accept="image/*" id="input" />
+            </div>
+        </template>
+
+        <script type="module" src="main.js"></script>
+    </body>
 </html>
