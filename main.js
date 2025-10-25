@@ -257,6 +257,8 @@ function imageDataToGif(image, config) {
 
     const imageElement = new Image();
     imageElement.src = gifUrl;
+    imageElement.width = image.width;
+    imageElement.height = image.height;
 
     arena.rewind(arenaSnapshot);
 
@@ -328,7 +330,6 @@ class ImageInput extends HTMLElement {
 
             const imageData = fileToImageData(image);
 
-            fileInput.value = '';
             this.showUploadedImage(image);
 
             const changeEvent = new CustomEvent('change', {
@@ -393,10 +394,9 @@ class App {
             const { imageData } = event.detail;
 
             this.inputImageData = imageData;
-            this.convertedImage?.remove();
+            this.convertedImage = null;
+            this.showConvertedImage(null);
         });
-
-        this.imageOutput = document.getElementById('image-output');
 
         this.config = new GifConfig();
 
@@ -424,9 +424,16 @@ class App {
     }
 
     showConvertedImage(image) {
-        image.classList.add('converted-image');
-        this.imageOutput.innerHTML = '';
-        this.imageOutput.appendChild(image);
+        const preview = document.getElementById('image-output-preview');
+        const imageOutput = document.getElementById('image-output');
+
+        if (image != null) {
+            preview.style.backgroundImage = `url(${image.src})`;
+            imageOutput.style.aspectRatio = `${image.width} / ${image.height}`;
+        } else {
+            preview.style.backgroundImage = null;
+            imageOutput.style.aspectRatio = '2 / 1';
+        }
     }
 }
 
