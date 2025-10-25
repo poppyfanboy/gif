@@ -110,9 +110,18 @@ img {
     }
 }
 
+/* Image input */
+
+image-input:not(:defined) {
+    display: block;
+    height: 15rem;
+    opacity: 0;
+}
+
 /* Image output */
 
 .image-output-container {
+    min-height: 15rem;
     display: flex;
     flex-direction: column;
     justify-content: space-between;
@@ -122,7 +131,6 @@ img {
 .image-output {
     position: relative;
     overflow: hidden;
-    aspect-ratio: 2 / 1;
     flex: 1;
     display: grid;
     place-items: center;
