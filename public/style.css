@@ -77,8 +77,8 @@ img {
 .app-container {
     width: 100%;
     display: grid;
-    align-items: start;
     gap: 1rem;
+    align-items: start;
 }
 
 @media (width < 800px) {
@@ -111,10 +111,18 @@ img {
     }
 }
 
+/* Image input */
+
+image-input:not(:defined) {
+    display: block;
+    height: 15rem;
+    opacity: 0;
+}
+
 /* Image output */
 
 .image-output-container {
-    height: 100%;
+    min-height: 15rem;
     display: flex;
     flex-direction: column;
     justify-content: space-between;
@@ -133,16 +141,6 @@ img {
     background-color: var(--section-color);
     border-radius: var(--border-radius);
     outline: 1px var(--section-color) solid;
-}
-
-@media (width < 1200px) {
-    .image-output {
-        aspect-ratio: 2 / 1;
-    }
-
-    .image-output:has(img) {
-        aspect-ratio: auto;
-    }
 }
 
 .image-output_preview {
