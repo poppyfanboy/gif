@@ -1,9 +1,10 @@
 <!doctype html>
 
-<html>
+<html lang="en">
     <head>
         <title>GIF Encoder</title>
         <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <link rel="stylesheet" href="modern-normalize.css" />
         <link rel="stylesheet" href="style.css" />
     </head>
@@ -14,14 +15,14 @@
 
             <div class="app-container">
                 <div class="gif-config">
-                    <span class="gif-config_label">Palette</span>
+                    <label class="gif-config_label" for="palette-select">Palette</label>
                     <select id="palette-select">
                         <option value="web-safe">Web-safe</option>
                         <option value="monochrome">Monochrome</option>
                         <option value="black-white">Black and white</option>
                     </select>
 
-                    <button id="convert-button" class="gif-config_convert-button">
+                    <button id="convert-button" class="gif-config_convert-button button">
                         Convert
                     </button>
                 </div>
@@ -29,8 +30,26 @@
                 <image-input></image-input>
 
                 <div class="image-output-container">
-                    <div id="image-output" class="image-output"></div>
-                    <button id="download-button">Download</button>
+                    <div id="image-output" class="image-output">
+                        <svg xmlns="http://www.w3.org/2000/svg" style="opacity: 0.125" width="48" height="48" viewBox="0 0 24 24" fill="none">
+                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                                d="M4 17L7.58959 13.7694C8.38025 13.0578 9.58958 13.0896 10.3417
+                                13.8417L11.5 15L15.0858 11.4142C15.8668 10.6332 17.1332 10.6332
+                                17.9142 11.4142L20 13.5M11 9C11 9.55228 10.5523 10 10 10C9.44772 10
+                                9 9.55228 9 9C9 8.44772 9.44772 8 10 8C10.5523 8 11 8.44772 11 9ZM6
+                                20H18C19.1046 20 20 19.1046 20 18V6C20 4.89543 19.1046 4 18
+                                4H6C4.89543 4 4 4.89543 4 6V18C4 19.1046 4.89543 20 6 20Z" />
+                        </svg>
+                        <div class="image-output_preview" id="image-output-preview"></div>
+                    </div>
+                    <button id="download-button" class="button">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="0.8em" height="1.25em" viewBox="0 0 16 24" fill="none">
+                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                                d="M13 12L8 17M8 17L3 12M8 17V4M13 20H3"
+                            />
+                        </svg>
+                        <span>Download</span>
+                    </button>
                 </div>
             </div>
         </main>
@@ -42,7 +61,6 @@
                 .root {
                     display: flex;
                     flex-direction: column;
-                    align-items: start;
                     gap: 1rem;
                 }
 
@@ -50,12 +68,16 @@
                     position: relative;
                     width: 100%;
                     aspect-ratio: 2 / 1;
-                    border: solid 1px black;
 
                     display: grid;
                     place-items: center;
 
                     cursor: pointer;
+                    text-align: center;
+                    background-color: var(--section-color);
+                    color: var(--text-muted-color);
+                    border-radius: var(--border-radius);
+                    outline: 1px var(--section-color) solid;
                 }
 
                 .overlay {
@@ -67,8 +89,8 @@
 
                     opacity: 0;
 
-                    background-color: black;
-                    color: white;
+                    background-color: var(--section-color);
+                    color: var(--text-muted-color);
                 }
 
                 .overlay--visible {
@@ -78,7 +100,7 @@
                 .overlay--active::after {
                     position: absolute;
                     inset: 1rem;
-                    border: 3px dashed white;
+                    border: 3px dashed var(--text-muted-color);
 
                     content: "";
                 }
@@ -89,6 +111,41 @@
                     background-size: cover;
                     background-repeat: no-repeat;
                     background-position: center;
+                    border-radius: var(--border-radius);
+                }
+
+                .input-wrapper {
+                    position: relative;
+                    padding: 0.5em 0.675em;
+                    border: none;
+                    overflow: hidden;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 0.25em;
+
+                    cursor: pointer;
+                    border-radius: var(--border-radius);
+                    background-color: var(--primary-color);
+                    color: var(--primary-text-color);
+                }
+
+                .input-wrapper:hover {
+                    background-color: var(--primary-hover-color);
+                }
+
+                .input-wrapper:active {
+                    background-color: var(--primary-active-color);
+                }
+
+                input {
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    opacity: 0;
+                    cursor: pointer;
                 }
             </style>
 
@@ -98,7 +155,18 @@
                     <div class="preview"></div>
                     <div class="overlay">Drop an image here.</div>
                 </label>
-                <input type="file" autocomplete="off" accept="image/*" id="input" />
+                <div class="input-wrapper">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="1.25em" height="1.25em" viewBox="0 0 24 24" fill="none">
+                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                            d="M7 19H5C3.89543 19 3 18.1046 3 17V7C3 5.89543 3.89543 5 5 5L8.67157
+                            5C9.20201 5 9.71071 5.21071 10.0858 5.58579L11.5 7H19C20.1046 7 21
+                            7.89543 21 9V17C21 18.1046 20.1046 19 19 19H17M12 19V11M12 11L15 14M12
+                            11L9 14"
+                        />
+                    </svg>
+                    <span>Select image</span>
+                    <input type="file" autocomplete="off" accept="image/*" id="input" />
+                </div>
             </div>
         </template>
 
