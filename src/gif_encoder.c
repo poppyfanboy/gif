@@ -1544,12 +1544,12 @@ u8 *palette_by_modified_median_cut(
             for (isize i = 1; i < queue.active_count; i += 1) {
                 isize current = i;
                 Box current_box = queue.boxes[current];
-                isize current_priority = current_box.color_count * current_box.volume;
+                i64 current_priority = (i64)current_box.color_count * current_box.volume;
 
                 while (current > 0) {
                     isize parent = (current - 1) / 2;
-                    isize parent_priority =
-                        queue.boxes[parent].color_count * queue.boxes[parent].volume;
+                    i64 parent_priority =
+                        (i64)queue.boxes[parent].color_count * queue.boxes[parent].volume;
 
                     if (parent_priority > current_priority) {
                         break;
@@ -1685,26 +1685,26 @@ u8 *palette_by_modified_median_cut(
         // Replace the "next_box" with the left box in the queue.
         if (left_box.max[this_dimension] - left_box.min[this_dimension] > 0) {
             isize current = 0;
-            isize current_priority = volume_affects_priority
-                ? left_box.color_count * left_box.volume
-                : left_box.color_count;
+            i64 current_priority = volume_affects_priority
+                ? (i64)left_box.color_count * left_box.volume
+                : (i64)left_box.color_count;
 
             while (2 * current + 1 < queue.active_count) {
                 isize left = 2 * current + 1;
-                isize left_priority = volume_affects_priority
-                    ? queue.boxes[left].color_count * queue.boxes[left].volume
-                    : queue.boxes[left].color_count;
+                i64 left_priority = volume_affects_priority
+                    ? (i64)queue.boxes[left].color_count * queue.boxes[left].volume
+                    : (i64)queue.boxes[left].color_count;
 
                 isize right = 2 * current + 2;
-                isize right_priority = -1;
+                i64 right_priority = -1;
                 if (right < queue.active_count) {
                     right_priority = volume_affects_priority
-                        ? queue.boxes[right].color_count * queue.boxes[right].volume
-                        : queue.boxes[right].color_count;
+                        ? (i64)queue.boxes[right].color_count * queue.boxes[right].volume
+                        : (i64)queue.boxes[right].color_count;
                 }
 
                 isize max = current;
-                isize max_priority = current_priority;
+                i64 max_priority = current_priority;
 
                 if (left_priority > max_priority) {
                     max = left;
@@ -1731,15 +1731,15 @@ u8 *palette_by_modified_median_cut(
             queue.total_count += 1;
 
             isize current = queue.active_count - 1;
-            isize current_priority = volume_affects_priority
-                ? right_box.color_count * right_box.volume
-                : right_box.color_count;
+            i64 current_priority = volume_affects_priority
+                ? (i64)right_box.color_count * right_box.volume
+                : (i64)right_box.color_count;
 
             while (current > 0) {
                 isize parent = (current - 1) / 2;
-                isize parent_priority = volume_affects_priority
-                    ? queue.boxes[parent].color_count * queue.boxes[parent].volume
-                    : queue.boxes[parent].color_count;
+                i64 parent_priority = volume_affects_priority
+                    ? (i64)queue.boxes[parent].color_count * queue.boxes[parent].volume
+                    : (i64)queue.boxes[parent].color_count;
 
                 if (parent_priority > current_priority) {
                     break;
