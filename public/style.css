@@ -23,6 +23,10 @@
     select {
         color-scheme: dark;
     }
+
+    input[type=number] {
+        color-scheme: dark;
+    }
 }
 
 body {
@@ -44,6 +48,9 @@ img {
     height: auto;
 }
 
+input[type=radio] {
+    accent-color: var(--primary-color);
+}
 
 .container {
     max-width: 1600px;
@@ -157,7 +164,7 @@ image-input:not(:defined) {
     grid-area: config;
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: 1rem;
     min-width: 16rem;
 }
 
@@ -168,16 +175,21 @@ image-input:not(:defined) {
     }
 }
 
-.gif-config_label:has(+ [disabled]) {
-    color: gray;
+.gif-config_label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
 }
 
-.gif-config_item {
+.gif-config_label--hidden {
+    display: none;
+}
+
+.gif-config_palette-type {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
+    gap: 1rem;
 }
 
 .gif-config_convert-button {
-    margin-top: 0.5rem;
+    margin-top: 0.25rem;
 }

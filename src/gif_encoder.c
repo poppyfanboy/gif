@@ -84,6 +84,13 @@ static f64 f64_random(pcg32_random_t *rng) {
     #define GIF_LIB_DEFINE(name)
 #else
     #define GIF_LIB_DEFINE(name) __attribute__((export_name(#name)))
+
+    extern unsigned char __heap_base;
+
+    GIF_LIB_DEFINE(get_heap_base)
+    void *get_heap_base() {
+        return &__heap_base;
+    }
 #endif
 
 #define sizeof(expr) (isize)sizeof(expr)
