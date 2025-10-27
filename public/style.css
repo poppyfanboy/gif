@@ -71,12 +71,32 @@ input[type=radio] {
     color: var(--primary-text-color);
 }
 
-.button:hover {
+.button:not(:disabled):hover {
     background-color: var(--primary-hover-color);
 }
 
-.button:active {
+.button:not(:disabled):active {
     background-color: var(--primary-active-color);
+}
+
+.button:disabled {
+    opacity: 0.6;
+    cursor: auto;
+}
+
+.spinner-icon {
+    display: none;
+    animation: spinner 1000ms linear infinite;
+}
+
+.button.loading .spinner-icon {
+    display: block;
+}
+
+@keyframes spinner {
+    to {
+        transform: rotate(360deg);
+    }
 }
 
 /* App */

@@ -60,11 +60,11 @@
                     <label class="gif-config_label gif-config_label--hidden" id="palette-algorithm-label">
                         <span>Palette algorithm</span>
                         <select id="palette-algorithm-select">
-                            <option value="median-cut">Median-cut</option>
-                            <option value="k-means">K-means</option>
-                            <option value="k-means++">K-means++</option>
                             <option value="modified-median-cut">Modified median-cut (MMCQ)</option>
                             <option value="octree">Octree</option>
+                            <option value="k-means">K-means</option>
+                            <option value="k-means++">K-means++</option>
+                            <option value="median-cut">Median-cut</option>
                         </select>
                     </label>
 
@@ -74,7 +74,12 @@
                     </label>
 
                     <button id="convert-button" class="gif-config_convert-button button">
-                        Convert
+                        <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 40 40" class="spinner-icon">
+                            <path fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round"
+                                d="M 36 20 A 16 16 0 1 1 20 4"
+                            />
+                        </svg>
+                        <span>Convert</span>
                     </button>
                 </div>
 
@@ -184,12 +189,17 @@
                     color: var(--primary-text-color);
                 }
 
-                .input-wrapper:hover {
+                .input-wrapper:not(:has(input:disabled)):hover {
                     background-color: var(--primary-hover-color);
                 }
 
-                .input-wrapper:active {
+                .input-wrapper:not(:has(input:disabled)):active {
                     background-color: var(--primary-active-color);
+                }
+
+                .input-wrapper:has(input:disabled) {
+                    opacity: 0.6;
+                    cursor: auto;
                 }
 
                 input {
@@ -201,9 +211,13 @@
                     opacity: 0;
                     cursor: pointer;
                 }
+
+                input:disabled {
+                    cursor: auto;
+                }
             </style>
 
-            <div class="root">
+            <div class="root" id="root">
                 <label class="drop-zone" for="input">
                     <span>Drop an image here, or click to upload.</span>
                     <div class="preview"></div>
