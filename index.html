@@ -14,16 +14,72 @@
             <h1>GIF Encoder</h1>
 
             <div class="app-container">
-                <div class="gif-config">
-                    <label class="gif-config_label" for="palette-select">Palette</label>
-                    <select id="palette-select">
-                        <option value="web-safe">Web-safe</option>
-                        <option value="monochrome">Monochrome</option>
-                        <option value="black-white">Black and white</option>
-                    </select>
+                <div class="gif-config" id="gif-config">
+                    <label class="gif-config_label">
+                        <span>Color space</span>
+                        <select id="color-space-select">
+                            <option value="srgb">sRGB</option>
+                            <option value="linear">Linear</option>
+                            <option value="lab">LAB</option>
+                            <option value="oklab">OKLAB</option>
+                        </select>
+                    </label>
+
+                    <label class="gif-config_label">
+                        <span>Dithering algorithm</span>
+                        <select id="dithering-algorithm-select">
+                            <option value="none">None</option>
+                            <option value="floyd-steinberg">Floyd-Steinberg</option>
+                            <option value="ordered">Ordered</option>
+                        </select>
+                    </label>
+
+                    <div class="gif-config_label">
+                        <span>Palette type</span>
+                        <div class="gif-config_palette-type">
+                            <label>
+                                <input type="radio" name="palette-type" value="fixed" checked />
+                                <span>Fixed</span>
+                            </label>
+                            <label>
+                                <input type="radio" name="palette-type" value="generated" />
+                                <span>Generated</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <label class="gif-config_label" id="fixed-palette-label">
+                        <span>Fixed palette</span>
+                        <select id="fixed-palette-select">
+                            <option value="web-safe">Web-safe</option>
+                            <option value="monochrome">Monochrome</option>
+                            <option value="black-white">Black and white</option>
+                        </select>
+                    </label>
+
+                    <label class="gif-config_label gif-config_label--hidden" id="palette-algorithm-label">
+                        <span>Palette algorithm</span>
+                        <select id="palette-algorithm-select">
+                            <option value="modified-median-cut">Modified median-cut (MMCQ)</option>
+                            <option value="octree">Octree</option>
+                            <option value="k-means">K-means</option>
+                            <option value="k-means++">K-means++</option>
+                            <option value="median-cut">Median-cut</option>
+                        </select>
+                    </label>
+
+                    <label class="gif-config_label gif-config_label--hidden" id="palette-color-count-label">
+                        <span>Palette color count</span>
+                        <input type="number" id="palette-color-count-input" value="16" min="1" max="256" />
+                    </label>
 
                     <button id="convert-button" class="gif-config_convert-button button">
-                        Convert
+                        <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 40 40" class="spinner-icon">
+                            <path fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round"
+                                d="M 36 20 A 16 16 0 1 1 20 4"
+                            />
+                        </svg>
+                        <span>Convert</span>
                     </button>
                 </div>
 
@@ -38,7 +94,8 @@
                                 17.9142 11.4142L20 13.5M11 9C11 9.55228 10.5523 10 10 10C9.44772 10
                                 9 9.55228 9 9C9 8.44772 9.44772 8 10 8C10.5523 8 11 8.44772 11 9ZM6
                                 20H18C19.1046 20 20 19.1046 20 18V6C20 4.89543 19.1046 4 18
-                                4H6C4.89543 4 4 4.89543 4 6V18C4 19.1046 4.89543 20 6 20Z" />
+                                4H6C4.89543 4 4 4.89543 4 6V18C4 19.1046 4.89543 20 6 20Z"
+                            />
                         </svg>
                         <div class="image-output_preview" id="image-output-preview"></div>
                     </div>
@@ -132,12 +189,17 @@
                     color: var(--primary-text-color);
                 }
 
-                .input-wrapper:hover {
+                .input-wrapper:not(:has(input:disabled)):hover {
                     background-color: var(--primary-hover-color);
                 }
 
-                .input-wrapper:active {
+                .input-wrapper:not(:has(input:disabled)):active {
                     background-color: var(--primary-active-color);
+                }
+
+                .input-wrapper:has(input:disabled) {
+                    opacity: 0.6;
+                    cursor: auto;
                 }
 
                 input {
@@ -149,9 +211,13 @@
                     opacity: 0;
                     cursor: pointer;
                 }
+
+                input:disabled {
+                    cursor: auto;
+                }
             </style>
 
-            <div class="root">
+            <div class="root" id="root">
                 <label class="drop-zone" for="input">
                     <span>Drop an image here, or click to upload.</span>
                     <div class="preview"></div>
